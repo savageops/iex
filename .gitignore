@@ -1,0 +1,10 @@
+/target/
+/node_modules/
+/tools/reports/*.jsonl
+/tools/reports/*.json
+/tools/data/corpus/
+.DS_Store
+Thumbs.db
+/.docs
+AGENTS.md
+/.refs

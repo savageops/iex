@@ -1,0 +1,20 @@
+{
+  "name": "iex-engine-v2",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "fixtures": "node tools/scripts/generate-fixtures.mjs",
+    "test": "vitest run --config vitest.config.ts",
+    "test:watch": "vitest --config vitest.config.ts",
+    "bench:once": "node tools/scripts/run-once-benchmark.mjs",
+    "bench:loop": "node tools/scripts/bench-loop.mjs",
+    "dashboard": "node tools/scripts/dashboard-server.mjs",
+    "materialize:tests": "node tools/scripts/materialize-tests.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^24.6.1",
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.9"
+  }
+}

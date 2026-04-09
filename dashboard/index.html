@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>iEx Benchmark Live Dashboard</title>
+    <style>
+      :root {
+        --bg: #0b1220;
+        --panel: #121a2c;
+        --panel-2: #1a2743;
+        --text: #f7fafc;
+        --muted: #9fb0d1;
+        --good: #2fbf71;
+        --bad: #ff6b6b;
+        --accent: #5ab0ff;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: radial-gradient(circle at 10% 10%, #1b2a4c, var(--bg));
+        color: var(--text);
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      }
+      .wrap {
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 20px;
+        display: grid;
+        gap: 16px;
+      }
+      .card {
+        background: linear-gradient(180deg, var(--panel), var(--panel-2));
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 14px;
+        padding: 16px;
+      }
+      .metrics {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 10px;
+      }
+      .metric {
+        background: rgba(7, 11, 20, 0.45);
+        border-radius: 10px;
+        padding: 10px;
+      }
+      .metric .label { font-size: 12px; color: var(--muted); }
+      .metric .value { font-size: 22px; font-weight: 700; }
+      canvas {
+        width: 100%;
+        height: 320px;
+        background: rgba(0, 0, 0, 0.22);
+        border-radius: 12px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13px;
+      }
+      th, td {
+        text-align: left;
+        padding: 8px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      }
+      .good { color: var(--good); }
+      .bad { color: var(--bad); }
+      .muted { color: var(--muted); }
+    </style>
+  </head>
+  <body>
+    <main class="wrap">
+      <section class="card">
+        <h1>iEx Live Benchmark Monitor</h1>
+        <p class="muted">Loop telemetry for iEx vs ripgrep, hotspot diagnostics, and 50% speed goal tracking.</p>
+        <div class="metrics" id="metric-grid"></div>
+      </section>
+
+      <section class="card">
+        <h2>Runtime Trend</h2>
+        <canvas id="trend" width="1100" height="320"></canvas>
+      </section>
+
+      <section class="card">
+        <h2>Recent Runs</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Profile</th>
+              <th>iEx Core ms</th>
+              <th>iEx CLI ms</th>
+              <th>rg ms</th>
+              <th>Speedup</th>
+              <th>Hotspot</th>
+              <th>Analysis</th>
+            </tr>
+          </thead>
+          <tbody id="run-table"></tbody>
+        </table>
+      </section>
+
+      <section class="card">
+        <h2>Slowest Files (Latest Run)</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Path</th>
+              <th>Duration ms</th>
+              <th>Bytes</th>
+            </tr>
+          </thead>
+          <tbody id="slow-table"></tbody>
+        </table>
+      </section>
+    </main>
+
+    <script>
+      const history = [];
+      const trend = document.getElementById("trend");
+      const ctx = trend.getContext("2d");
+      const metricGrid = document.getElementById("metric-grid");
+      const runTable = document.getElementById("run-table");
+      const slowTable = document.getElementById("slow-table");
+
+      function fmt(ms) {
+        return Number(ms || 0).toFixed(2);
+      }
+
+      function renderMetrics(latest) {
+        const speed = latest?.speedupPct ?? 0;
+        const goalGap = latest?.goalGapPct ?? 50;
+        const classes = speed >= 50 ? "good" : "bad";
+        const data = [
+          ["Total runs", history.length],
+          ["Latest iEx core ms", fmt(latest?.iexMs)],
+          ["Latest iEx CLI ms", fmt(latest?.iexCliMs)],
+          ["iEx process overhead ms", fmt(latest?.iexProcessOverheadMs)],
+          ["Latest rg ms", fmt(latest?.rgMs)],
+          ["Speedup %", `<span class="${classes}">${speed.toFixed(2)}%</span>`],
+          ["Goal gap %", `<span class="${goalGap <= 0 ? "good" : "bad"}">${goalGap.toFixed(2)}</span>`],
+          ["Hotspot", latest?.hotspot ?? "n/a"],
+        ];
+
+        metricGrid.innerHTML = data
+          .map(([label, value]) => `<div class="metric"><div class="label">${label}</div><div class="value">${value}</div></div>`)
+          .join("");
+      }
+
+      function drawTrend() {
+        ctx.clearRect(0, 0, trend.width, trend.height);
+        if (history.length === 0) {
+          return;
+        }
+
+        const recent = history.slice(-80);
+        const maxY = Math.max(...recent.map((run) => Math.max(run.iexMs, run.rgMs)), 1);
+        const minY = 0;
+        const pad = 30;
+        const w = trend.width - pad * 2;
+        const h = trend.height - pad * 2;
+
+        function point(index, value) {
+          const x = pad + (index / Math.max(1, recent.length - 1)) * w;
+          const y = pad + h - ((value - minY) / (maxY - minY || 1)) * h;
+          return [x, y];
+        }
+
+        ctx.strokeStyle = "#2d3f67";
+        ctx.lineWidth = 1;
+        for (let i = 0; i <= 5; i += 1) {
+          const y = pad + (h / 5) * i;
+          ctx.beginPath();
+          ctx.moveTo(pad, y);
+          ctx.lineTo(pad + w, y);
+          ctx.stroke();
+        }
+
+        function drawSeries(key, color) {
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          recent.forEach((run, index) => {
+            const [x, y] = point(index, run[key]);
+            if (index === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+          });
+          ctx.stroke();
+        }
+
+        drawSeries("iexMs", "#5ab0ff");
+        drawSeries("rgMs", "#ff8d6b");
+      }
+
+      function renderTable() {
+        runTable.innerHTML = history
+          .slice(-15)
+          .reverse()
+          .map((run) => {
+            const speedCls = run.speedupPct >= 50 ? "good" : "bad";
+            return `<tr>
+              <td>${new Date(run.timestamp).toLocaleTimeString()}</td>
+              <td>${run.profile}</td>
+              <td>${fmt(run.iexMs)}</td>
+              <td>${fmt(run.iexCliMs)}</td>
+              <td>${fmt(run.rgMs)}</td>
+              <td class="${speedCls}">${run.speedupPct.toFixed(2)}%</td>
+              <td>${run.hotspot}</td>
+              <td>${run.analysis}</td>
+            </tr>`;
+          })
+          .join("");
+      }
+
+      function renderSlow(latest) {
+        const rows = latest?.slowestFiles ?? [];
+        slowTable.innerHTML = rows
+          .map((row) => `<tr><td>${row.path}</td><td>${fmt(row.duration_ms)}</td><td>${row.bytes}</td></tr>`)
+          .join("");
+      }
+
+      function pushRun(run) {
+        history.push(run);
+        const latest = history[history.length - 1];
+        renderMetrics(latest);
+        drawTrend();
+        renderTable();
+        renderSlow(latest);
+      }
+
+      async function bootstrap() {
+        const response = await fetch("/api/history");
+        const data = await response.json();
+        for (const run of data.history || []) {
+          history.push(run);
+        }
+        const latest = history[history.length - 1] || null;
+        renderMetrics(latest);
+        drawTrend();
+        renderTable();
+        renderSlow(latest);
+
+        const es = new EventSource("/events");
+        es.addEventListener("run", (event) => {
+          pushRun(JSON.parse(event.data));
+        });
+      }
+
+      bootstrap();
+    </script>
+  </body>
+</html>
