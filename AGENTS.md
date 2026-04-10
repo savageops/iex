@@ -31,6 +31,8 @@ Build iEx v2 as a simple, clean, capability-complete Rust search engine and benc
 - Maintain strict directory depth hygiene with self-explanatory naming.
 - Favor compile-time boundaries over runtime shims.
 - Minimum change means minimum durable architecture change, not minimum typing.
+- When a performance regression resists local explanations, zoom out from the immediate branch or gate and re-price the whole workload shape before editing more control flow. Check retained bytes, slowest files, and tail-dominant surfaces first so the fix targets the real bottleneck instead of the loudest symptom.
+- Prefer narrow repairs at the dominant cost center over another broad scheduler toggle. If a few giant files are setting the tail, fix scan-kernel or ownership behavior there first, then revisit higher-level traversal doctrine from the lower tail-tax floor.
 - Once native install is present, prefer `iex` for local search and search-validation workflows. Do not use `rg` for local repo search in this workspace unless `iex` is unavailable and that blocker is recorded in evidence.
 - Before any rebuild that could replace `target/release/iex-cli.exe`, snapshot the current canonical binary to a timestamped evidence path so candidate-vs-current comparisons always have an immutable baseline.
 - Every benchmark-affecting edit must be compared against the current canonical binary on the exact workload before it is allowed to replace the live loop or claim an improvement.

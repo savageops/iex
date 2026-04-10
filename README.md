@@ -1,153 +1,394 @@
 # iEx Engine v2
 
-iEx (`intelligent expressions`) is a Rust-first search framework designed to evolve beyond linear regex workflows.
+iEx is a Rust search engine and benchmark platform for line-oriented text and code search.
+It is built around a small expression language, an inspectable planner, and an evidence-first optimization loop.
+The goal is not to be "another grep wrapper." The goal is to make search behavior, search cost, and benchmark truth explicit enough to improve the engine like an engine.
 
 Canonical repo: [github.com/savageops/iEx](https://github.com/savageops/iEx)  
 Canonical site: [iex.run](https://iex.run)
 
-## Layout
+## What iEx Is Trying To Do
 
-- `crates/iex-core`: expression planner + high-throughput scanner
-- `crates/iex-cli`: CLI binary surface
-- `crates/iex-bench`: benchmark helper binary
-- `tests`: Vitest suites (300+ materialized tests)
-- `tools/scripts`: benchmark loop + report tooling
-- `dashboard`: live HTML dashboard for loop telemetry
-- `.refs/ripgrep`: upstream baseline reference clone
-- `todo/pending`: planning-spec todo chain
+Most command-line search tools start from one pattern and a bag of flags.
+iEx starts from a query plan.
 
-## Search Execution Model
+Today, that plan is intentionally small:
 
-- Direct file roots scan as a single target without walking through ignore traversal first.
-- Multiple file and directory roots can be supplied in one invocation; directory roots share one discovery surface while direct-file roots stay on the existing direct-target path.
-- Overlapping or repeated roots are deduped before scan so mixed file-plus-directory invocations do not double-count work.
-- Very large direct-file `--stats-only` workloads can shard safe fast-count byte ranges across cores inside that same single-file ownership path.
-- Directory roots use one discovered file list, then auto-select scan parallelism from corpus size.
-- Benchmark telemetry should reflect this single ownership path; avoid separate hybrid auto walkers or hidden fallback scan modes.
+- line-oriented matching over files and directories
+- boolean composition with `&&` and `||`
+- explicit predicate kinds for literals, prefixes, suffixes, and regex
+- a separate `explain` command that shows how the query was parsed
+- per-phase timings and slow-file telemetry on every search report
 
-## Quickstart
+That narrower surface is deliberate.
+It gives the repo room to optimize real execution paths instead of hiding complexity behind a large CLI surface too early.
+
+## Project Status
+
+iEx is an active performance project with a hard competitive target:
+reach ripgrep-class performance and track progress toward at least `50%` faster than ripgrep on agreed workloads.
+
+That target is real, but this README is not the source of truth for whether the target is currently met.
+Benchmark truth lives in the latest generated artifacts under `tools/reports/` and in the live dashboard loop, not in static prose.
+
+## Why This Repo Exists
+
+This repository is the working loop for four things that usually drift apart:
+
+1. the search engine itself
+2. the public CLI surface
+3. the benchmark and candidate-comparison harness
+4. the operator documentation needed to keep speed claims honest
+
+That is why the repo contains Rust crates, JavaScript benchmark scripts, a dashboard, reference clones, and planning-spec chains in one place.
+
+## Current Command Surface
+
+The public CLI is intentionally small:
+
+- `search`: run a search over one or more files or directories
+- `explain`: parse an expression and print the resulting plan as JSON
+
+Current help output:
+
+```text
+Usage: iex-cli.exe <COMMAND>
+
+Commands:
+  search
+  explain
+  help
+```
+
+The narrow command surface is a feature, not a gap.
+The repo is focused on the core search path first: parse well, execute well, measure well.
+
+## Query Language
+
+iEx expressions are built from explicit predicate tokens:
+
+| Predicate | Meaning | Example |
+| --- | --- | --- |
+| `lit:` | raw substring match | `lit:error` |
+| `prefix:` | line starts with the value | `prefix:WARN` |
+| `suffix:` | line ends with the value | `suffix:Exception` |
+| `re:` | regex match | `re:\btimeout\b` |
+
+Boolean composition is currently simple and explicit:
+
+- `A && B` means all predicates must match the same line
+- `A || B` means any predicate may match the line
+- a single expression is either one `&&` chain, one `||` chain, or one predicate
+- nested grouping is not part of the current grammar
+
+That last point matters.
+iEx is not pretending to expose a full query language yet.
+It exposes the planner surface the current engine can execute and benchmark cleanly.
+
+### Examples
+
+Search for lines that contain both a literal and a regex hit:
+
+```powershell
+cargo run -q -p iex-cli -- search "lit:error && re:\btimeout\b" logs --json
+```
+
+Search multiple roots in one command:
+
+```powershell
+cargo run -q -p iex-cli -- search "re:(ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT)" .refs\ripgrep\benchsuite\linux src
+```
+
+Inspect the parsed plan:
+
+```powershell
+cargo run -q -p iex-cli -- explain "lit:error && re:\btimeout\b"
+```
+
+Example `explain` output:
+
+```json
+{"source":"lit:error && re:\\btimeout\\b","mode":"all","predicates":[{"type":"literal","value":"error"},{"type":"regex","value":"\\btimeout\\b"}]}
+```
+
+## Search Semantics
+
+iEx is line-oriented today.
+Matches are reported with:
+
+- file path
+- line number
+- column
+- preview text
+
+When `--stats-only` is used, iEx stops collecting hit previews and returns counts plus telemetry.
+That is the mode the benchmark harness relies on most heavily, because it isolates search-core behavior from output volume.
+
+## How A Search Runs
+
+At a high level, the engine does this:
+
+1. parse the query into an `ExpressionPlan`
+2. partition inputs into direct-file roots and directory roots
+3. normalize and dedupe overlapping roots before scan ownership is assigned
+4. choose the execution path
+5. scan files, collect hits or counts, and emit timings
+
+The important part is step 4.
+iEx does not have one monolithic scan loop for every workload shape.
+It has a small number of explicit paths chosen by input shape and output mode.
+
+### Root Handling
+
+`search` accepts one or more `PATH` arguments.
+Those roots can be:
+
+- files
+- directories
+- a mix of both
+
+Directory roots share one discovery surface.
+Direct-file roots stay on the direct-target path.
+Overlaps and repeats are pruned before scan so mixed invocations do not silently double-count work.
+
+### Discovery
+
+Directory discovery is ignore-aware by default.
+The engine uses the standard ignore stack:
+
+- `.gitignore`
+- global git excludes
+- ignore files handled by the `ignore` crate stack
+
+Hidden files stay off unless `--hidden` is enabled.
+Symlink traversal stays off unless `--follow-symlinks` is enabled.
+
+### File Reading Strategy
+
+The engine does not read every file the same way.
+
+- tiny files are read directly into a fixed inline buffer
+- small files are loaded into memory
+- larger files are memory-mapped
+- likely binary files are rejected early by a null-byte sniff
+
+That is an engine choice, not a README flourish.
+The scan path is already shaped around different I/O costs.
+
+### Matching Strategy
+
+The planner and engine cooperate on a few key fast paths:
+
+- literal matching uses byte-native finders
+- regex predicates may collapse to faster literal-like paths when the regex shape allows it
+- alternates can use automaton-backed paths
+- `--stats-only` can take byte-count fast paths instead of full hit collection
+- very large direct-file stats-only workloads can split safe byte ranges across cores
+
+Recent engine work also widened compound `All` plans so queries such as `lit:A && lit:B` can take a reject-first byte path instead of always falling back to the slowest line loop.
+
+### Streaming Stats-Only Path
+
+There is a distinct streaming path for stats-only scans over multi-root directory workloads.
+That path exists so discovery and scan work do not have to be fully serialized before counting begins.
+
+This matters for telemetry interpretation:
+
+- `discover_ms`
+- `scan_ms`
+- `aggregate_ms`
+- `total_ms`
+
+These are real phase measurements, but on streaming paths `discover_ms` and `scan_ms` can overlap instead of behaving like simple additive buckets.
+
+## Output Model
+
+`search` can emit either a readable summary or JSON.
+
+Core report fields include:
+
+- query expression
+- hit list when hit collection is enabled
+- files discovered
+- files scanned
+- files skipped
+- matches found
+- bytes scanned
+- per-phase timings
+- slowest-file telemetry
+
+That report shape is not just for users.
+It is also the metric contract used by the benchmark harness and the dashboard.
+
+## Repository Layout
+
+| Path | Responsibility |
+| --- | --- |
+| `crates/iex-core` | planner, discovery, scan engine, telemetry |
+| `crates/iex-cli` | CLI contract for `search` and `explain` |
+| `crates/iex-bench` | Rust-side benchmark helper binary |
+| `tests/materialized` | explicit Vitest suites for contracts and benchmark tooling |
+| `tools/scripts` | fixtures, benchmark runners, compare tools, installer scripts |
+| `dashboard` | live benchmark dashboard |
+| `.refs/ripgrep` | local upstream reference clone |
+| `.refs/ugrep` | local contender reference clone |
+| `.docs/iex-v2-crown-jewel.md` | deeper execution and benchmark doctrine |
+| `todo/pending` | active planning-spec chains |
+
+## Build And Run
+
+### Basic local build
 
 ```powershell
 cargo build -p iex-cli
+```
+
+### CLI help
+
+```powershell
+cargo run -q -p iex-cli -- --help
+cargo run -q -p iex-cli -- search --help
+```
+
+### First searches
+
+```powershell
+cargo run -q -p iex-cli -- search "lit:Sherlock Holmes" .refs\ripgrep\benchsuite\subtitles\en.sample.txt
+cargo run -q -p iex-cli -- search "lit:error && re:\btimeout\b" . --json --stats-only
+cargo run -q -p iex-cli -- explain "lit:error && re:\btimeout\b"
+```
+
+### Contributor loop
+
+```powershell
 npm install
 npm run fixtures
 npm run test
-npm run bench:loop
-npm run dashboard
 ```
 
-## Native install
+## Native Install
 
-Install iEx as a native shell command so operators and agents use the same system-visible binary.
+For day-to-day operator use, iEx should be installed as a native command instead of run only through `cargo`.
 
-Windows:
+### Windows
 
 ```powershell
 npm run install:native:windows
 ```
 
-Cross-platform dispatcher:
+The Windows installer:
 
-```powershell
-npm run install:native
-```
-
-Windows installer contract:
 - builds `target/release/iex-cli.exe` when needed
-- snapshots the current release binary before any rebuild that would replace it
+- snapshots the current release binary before replacing it
 - installs the native command to `%LOCALAPPDATA%\Programs\iEx\bin\iex.exe`
-- adds that directory to the user `PATH`
-- writes a PowerShell profile block that removes the built-in `iex` alias (`Invoke-Expression`) and remaps `iex` to the installed iEx binary
+- updates the user `PATH`
+- remaps PowerShell's built-in `iex` alias so `iex` resolves to the installed binary in new sessions
 
-macOS / Linux:
+`iex.exe` remains directly callable even if a shell session has not reloaded yet.
+
+### macOS / Linux
 
 ```bash
 npm run install:native:unix
 ```
 
+The Unix installer:
+
+- builds `target/release/iex-cli` when needed
+- snapshots the current release binary before replacing it
+- installs the binary to `~/.local/bin/iex`
+- ensures `~/.local/bin` is exported in common shell profiles
+
 Cross-platform dispatcher:
 
 ```bash
 npm run install:native
 ```
 
-Unix installer contract:
-- builds `target/release/iex-cli` when needed
-- snapshots the current release binary before any rebuild that would replace it
-- installs the native command to `~/.local/bin/iex`
-- appends `~/.local/bin` PATH export blocks to the common shell profiles when missing
+## Benchmarking, Not Benchmark Theater
 
-Friend-safe macOS binary from CI:
-- run the GitHub Actions workflow in [build-native-binaries.yml](/E:/Workspaces/01_Projects/01_Github/iEx-Engine-v2/.github/workflows/build-native-binaries.yml)
-- download `iex-macos-x64` for Intel Macs or `iex-macos-arm64` for Apple Silicon Macs
-- unpack the archive and then run `bash tools/scripts/install-native.sh --source-binary /path/to/iex`
+Search projects become unserious the moment performance claims detach from reproducible workloads.
+This repo is set up specifically to stop that drift.
 
-Verification:
+### Canonical benchmark surfaces
+
+The repo keeps benchmark work split into canonical and diagnostic layers.
+
+Canonical:
+
+- `npm run bench:suite:list`
+- `npm run bench:suite:download`
+- `npm run bench:suite:bootstrap-data`
+- `npm run bench:report`
+- `npm run bench:loop`
+- `npm run dashboard`
+
+Diagnostic:
+
+- `npm run bench:once`
+- `npm run bench:report:diag`
+- `npm run bench:contenders:direct`
+
+The canonical suite is built around the ripgrep benchsuite corpora and current repo harnessing for:
+
+- Linux source workloads
+- English subtitles workloads
+- Russian subtitles workloads
+- literal, case-insensitive, word, alternates, surrounding-word, and no-literal regimes
+
+### Benchmark truth policy
+
+Three rules matter here:
+
+1. static README claims do not override current artifacts
+2. candidate binaries should be compared as immutable snapshots, not mutable `target/release` placeholders
+3. live-loop promotion must clear a full-suite proof gate, not a cherry-picked one-profile win
+
+That is why the benchmark scripts support `--iex-binary <path>`.
+It lets the repo replay a frozen baseline or candidate without silently rebuilding the binary being measured.
+
+Example pinned-binary replay:
 
 ```powershell
-iex --help
-iex search "lit:Sherlock Holmes" . --stats-only
-iex search "006-iex-upstream-harvest-expansion" todo .docs --stats-only
+npm run bench:loop -- --loops 1 --iex-binary tools/reports/candidate-compare/iex-cli-baseline-YYYYMMDD-HHMMSS.exe
 ```
 
-PowerShell note: `iex` normally resolves to `Invoke-Expression`. The Windows installer takes ownership of the `iex` command name in the current user's PowerShell profile so new sessions resolve to the native iEx binary. `iex.exe` remains directly callable at any time.
+### Reports and telemetry
 
-Cross-build note: a macOS binary cannot be linked from this Windows machine by Rust target installation alone. It still needs a real macOS runner or Apple SDK/toolchain. The workflow exists to keep that build canonical and reproducible.
+Key outputs:
 
-## Benchmark telemetry
+- `tools/reports/live-metrics.jsonl`: append-only live loop history
+- `tools/reports/latest.json`: latest live run snapshot
+- `tools/reports/bench/`: benchsuite and diagnostic artifacts
+- `tools/reports/candidate-compare/`: immutable binary snapshots and proof artifacts
+- `.docs/bench/metrics-index.md`: human-readable metric interpretation
 
-- Canonical benchmark suite (ripgrep benchsuite):
-  - list suite cases: `npm run bench:suite:list`
-  - download suite corpora (default `subtitles-en`): `npm run bench:suite:download`
-  - download specific corpus set: `npm run bench:suite:download -- subtitles-en subtitles-ru`
-  - Windows-safe full data bootstrap (subtitles + linux fallback path): `npm run bench:suite:bootstrap-data`
-  - run suite: `npm run bench:report`
-  - iEx diagnostic harness (non-canonical, for local hotspot triage):
-  - one-shot run: `node tools/scripts/run-once-benchmark.mjs --build-profile release --warmup 1`
-  - range report run: `npm run bench:report:diag -- --reps 5 --build-profile release --warmup 1 --samples 1`
-  - direct contender rerun on codedb: `npm run bench:contenders:direct -- --reps 25 --warmup 3`
-  - archive the current live loop and clear it for a fresh run while preserving self-improvement baseline knowledge: `npm run bench:reset`
-  - loop runner (suite-profile stream): `npm run bench:loop -- --loops 1 --build-profile release --warmup 1`
-  - legacy synthetic loop runner: `npm run bench:loop:diag -- --loops 1 --build-profile release --warmup 1`
-  - pinned-binary replay without rebuild: `npm run bench:loop -- --loops 1 --iex-binary tools/reports/candidate-compare/iex-cli-baseline-YYYYMMDD-HHMMSS.exe`
-  - live dashboard: `node tools/scripts/dashboard-server.mjs`
-  - optional external contenders are configured in `tools/scripts/competitors.json`; `ripgrep` is the baseline and `ugrep` is the current best-contender lane when available locally
-- Reports:
-  - `tools/reports/live-metrics.jsonl` (append-only live diagnostics history written by `npm run bench:loop`)
-  - `tools/reports/latest.json` (latest live diagnostics snapshot)
-  - `tools/reports/self-improvement-baseline.json` (preserved profile-normalized baseline used after live-window resets)
-  - `tools/reports/bench/v2-vs-rg-*.json` (full range report artifact)
-  - `tools/reports/bench/latest.json` (latest range report)
-  - `tools/reports/bench/ugrep-vs-iex-rg-direct-*.json` (direct contender rerun artifact on codedb)
-  - `tools/reports/bench/contenders-direct-latest.json` (latest direct contender rerun)
-  - `tools/reports/bench/ripgrep-benchsuite-*.csv` (latest raw ripgrep benchsuite artifact written by `npm run bench:report`)
-  - `.docs/bench/metrics-index.md` (human-readable metric interpretation guide)
-- Dashboard provenance: the live monitor summarizes `tools/reports/live-metrics.jsonl` and separately surfaces the latest `ripgrep-benchsuite-*.csv` artifact so benchsuite refresh status stays visible beside the live diagnostics feed.
-- Canonical performance measurement is the ripgrep benchsuite raw artifact plus the live iEx diagnostics window; the live diagnostics harness remains available for instrumentation and tuning.
-- Benchmark scripts accept `--iex-binary <path>` for explicit baseline/candidate replays; when supplied, the runner uses that immutable binary path instead of rebuilding `target/release/iex-cli.exe`.
-- Supported benchmark build profiles are `debug`, `release`, and `release-lto`; `release-lto` is the first canonical single-root proof candidate for binary-layout work.
-- Metric model:
-  - `iexMs`: iEx core engine time (`report.stats.timings.total_ms`)
-  - `iexCliMs`: full CLI wall-clock time (startup + parse + engine + output)
-  - `iexProcessOverheadMs`: `iexCliMs - iexMs`
-  - `rgMs`: ripgrep CLI wall-clock time
-  - `iexToRgRatio`: `iexMs / rgMs` (above 1.0x means iEx slower, below 1.0x means iEx faster)
-  - `competitors.<name>.durationMs`: optional direct-invocation timings for external contenders such as `ugrep`
-  - dashboard summary includes a `Competitor Summary` lane and primary challenger selection when contender data is present
-  - Range report includes min/median/p95/max by profile and phase slowdown attribution.
+The dashboard and compare artifacts exist because serious search work needs more than one timing number.
+You need to know whether the time moved in discovery, scan, aggregation, startup overhead, or one pathological file.
 
-## Ripgrep harvest
+## Current Boundaries
 
-- Reference clone: `.refs/ripgrep`
-- Harvest report: `.docs/recon/ripgrep-harvest-2026-04-08.md`
-- Key directive: reuse proven fast-path ideas (literal acceleration, adaptive search strategy, parallel traversal) while implementing iEx with clean, independent structure and measurable contracts.
+This README is intentionally explicit about what iEx is not doing yet.
 
-## Performance goal
+- it is not a full nested boolean query language
+- it is not an indexed search engine
+- it is not a multiline or archive-search engine
+- it is not claiming permanent category leadership based on one screenshot or one run
 
-The target is to iteratively optimize iEx until it beats ripgrep with a tracked goal of >= 50% faster than ripgrep on agreed benchmark suites.
+The current engine is strongest when described as it actually exists:
+a line-oriented, planner-driven, benchmark-heavy search engine under active optimization.
 
-Current benchmark truth must always come from the latest generated report artifact in `tools/reports/bench/` and live dashboard summary instead of static README claims.
+## Where To Read Next
 
-## Agent and operator usage rule
+If you want the deeper internal doctrine behind the repo:
 
-Once native install is present, prefer `iex` for local search, search validation, and operator workflows in this repo.
+- [`.docs/iex-v2-crown-jewel.md`](.docs/iex-v2-crown-jewel.md) for architecture, optimization waves, and live-loop promotion rules
+- [`.docs/recon/ripgrep-harvest-2026-04-08.md`](.docs/recon/ripgrep-harvest-2026-04-08.md) for the current upstream-harvest map
+- [`tools/scripts`](tools/scripts) for the benchmark and installation entrypoints
+- [`crates/iex-core`](crates/iex-core) for the planner and scan engine
+
+If you just want the shortest path to a real run:
+
+```powershell
+cargo run -q -p iex-cli -- search "lit:Sherlock Holmes" .refs\ripgrep\benchsuite\subtitles\en.sample.txt
+```

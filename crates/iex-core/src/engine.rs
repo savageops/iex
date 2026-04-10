@@ -5,12 +5,13 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        mpsc, Arc, Mutex,
+        Arc, Mutex,
     },
     time::Instant,
 };
 
 use anyhow::{Context, Result};
+use crossbeam_channel as channel;
 use ignore::{WalkBuilder, WalkState};
 use memchr::memchr;
 use memmap2::MmapOptions;
@@ -25,6 +26,8 @@ const BINARY_SNIFF_LIMIT: usize = 1024;
 const PARALLEL_FAST_COUNT_FILE_THRESHOLD: usize = 64 * 1024 * 1024;
 const PARALLEL_FAST_COUNT_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PARALLEL_FAST_COUNT_THREADS: usize = 12;
+const DOMINANT_FILE_PARALLEL_THRESHOLD: usize = 512 * 1024 * 1024;
+const DOMINANT_FILE_PARALLEL_THREAD_CAP: usize = 4;
 const MAX_STREAMING_SCAN_THREADS: usize = 12;
 const STREAMING_PATH_QUEUE_MULTIPLIER: usize = 4;
 
@@ -90,7 +93,7 @@ struct StreamingScanResult {
 
 #[derive(Clone)]
 struct DiscoveryDispatch {
-    sender: mpsc::SyncSender<PathBuf>,
+    sender: channel::Sender<PathBuf>,
     seen: Option<Arc<Mutex<BTreeSet<PathBuf>>>>,
     files_discovered: Arc<AtomicUsize>,
     duplicate_paths: Arc<AtomicUsize>,
@@ -221,7 +224,7 @@ fn discover_files_from_targets(
 }
 
 fn should_stream_stats_only(config: &SearchConfig, roots: &RootTargets) -> bool {
-    !config.collect_hits && !roots.directory_roots.is_empty()
+    !config.collect_hits && !roots.directory_roots.is_empty() && roots.telemetry.input_roots > 1
 }
 
 fn build_walk_builder(config: &SearchConfig, roots: &[PathBuf]) -> WalkBuilder {
@@ -242,7 +245,7 @@ fn build_walk_builder(config: &SearchConfig, roots: &[PathBuf]) -> WalkBuilder {
 
 fn discover_files_parallel(config: &SearchConfig, roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let builder = build_walk_builder(config, roots);
-    let (sender, receiver) = mpsc::channel::<PathBuf>();
+    let (sender, receiver) = channel::unbounded::<PathBuf>();
     let walker = builder.build_parallel();
     walker.run(|| {
         let sender = sender.clone();
@@ -494,9 +497,8 @@ fn scan_paths_streaming_stats_only(
     let queue_depth = resolved_threads
         .saturating_mul(STREAMING_PATH_QUEUE_MULTIPLIER)
         .max(1);
-    let (path_sender, path_receiver) = mpsc::sync_channel::<PathBuf>(queue_depth);
-    let (outcome_sender, outcome_receiver) = mpsc::channel::<FileScanOutcome>();
-    let receiver = Arc::new(Mutex::new(path_receiver));
+    let (path_sender, path_receiver) = channel::bounded::<PathBuf>(queue_depth);
+    let (outcome_sender, outcome_receiver) = channel::unbounded::<FileScanOutcome>();
     let plan = Arc::new(config.plan.clone());
     let dispatch = DiscoveryDispatch::new(path_sender, roots.telemetry.effective_roots > 1);
     let files_discovered = Arc::clone(&dispatch.files_discovered);
@@ -507,13 +509,14 @@ fn scan_paths_streaming_stats_only(
         std::thread::scope(move |scope| -> Result<(f64, Vec<FileScanOutcome>)> {
             let producer_dispatch = dispatch;
             for _ in 0..resolved_threads {
-                let receiver = Arc::clone(&receiver);
+                let receiver = path_receiver.clone();
                 let outcome_sender = outcome_sender.clone();
                 let plan = Arc::clone(&plan);
                 scope.spawn(move || {
                     worker_scan_loop(receiver, outcome_sender, plan, resolved_threads);
                 });
             }
+            drop(path_receiver);
             drop(outcome_sender);
 
             let discover_started = Instant::now();
@@ -566,19 +569,13 @@ fn discover_files_streaming(
 }
 
 fn worker_scan_loop(
-    receiver: Arc<Mutex<mpsc::Receiver<PathBuf>>>,
-    sender: mpsc::Sender<FileScanOutcome>,
+    receiver: channel::Receiver<PathBuf>,
+    sender: channel::Sender<FileScanOutcome>,
     plan: Arc<ExpressionPlan>,
     resolved_threads: usize,
 ) {
     loop {
-        let received = {
-            let receiver = receiver
-                .lock()
-                .expect("streaming path receiver should not be poisoned");
-            receiver.recv()
-        };
-        let path = match received {
+        let path = match receiver.recv() {
             Ok(path) => path,
             Err(_) => break,
         };
@@ -592,7 +589,7 @@ fn worker_scan_loop(
 }
 
 impl DiscoveryDispatch {
-    fn new(sender: mpsc::SyncSender<PathBuf>, dedupe: bool) -> Self {
+    fn new(sender: channel::Sender<PathBuf>, dedupe: bool) -> Self {
         Self {
             sender,
             seen: dedupe.then(|| Arc::new(Mutex::new(BTreeSet::new()))),
@@ -862,7 +859,31 @@ fn maybe_parallel_fast_count_bytes(
     bytes: &[u8],
     thread_budget: usize,
 ) -> Option<usize> {
-    if thread_budget > 1 || bytes.len() < PARALLEL_FAST_COUNT_FILE_THRESHOLD {
+    let parallel_threads = parallel_fast_count_threads(bytes.len(), thread_budget)?;
+    let chunk_size = bytes
+        .len()
+        .div_ceil(parallel_threads.saturating_mul(2))
+        .max(PARALLEL_FAST_COUNT_CHUNK_BYTES);
+    let ranges = build_chunk_ranges(bytes.len(), chunk_size);
+    if ranges.len() <= 1 {
+        return None;
+    }
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(parallel_threads)
+        .build()
+        .ok()?;
+    pool.install(|| {
+        ranges
+            .par_iter()
+            .map(|(start, end)| plan.fast_match_count_no_hits_bytes_in_range(bytes, *start, *end))
+            .collect::<Option<Vec<_>>>()
+            .map(|counts| counts.into_iter().sum())
+    })
+}
+
+fn parallel_fast_count_threads(file_len: usize, thread_budget: usize) -> Option<usize> {
+    if file_len < PARALLEL_FAST_COUNT_FILE_THRESHOLD {
         return None;
     }
 
@@ -874,26 +895,16 @@ fn maybe_parallel_fast_count_bytes(
         return None;
     }
 
-    let chunk_size = bytes
-        .len()
-        .div_ceil(available_threads.saturating_mul(2))
-        .max(PARALLEL_FAST_COUNT_CHUNK_BYTES);
-    let ranges = build_chunk_ranges(bytes.len(), chunk_size);
-    if ranges.len() <= 1 {
+    if thread_budget <= 1 {
+        return Some(available_threads);
+    }
+
+    if file_len < DOMINANT_FILE_PARALLEL_THRESHOLD {
         return None;
     }
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(available_threads)
-        .build()
-        .ok()?;
-    pool.install(|| {
-        ranges
-            .par_iter()
-            .map(|(start, end)| plan.fast_match_count_no_hits_bytes_in_range(bytes, *start, *end))
-            .collect::<Option<Vec<_>>>()
-            .map(|counts| counts.into_iter().sum())
-    })
+    let dominant_threads = available_threads.min(DOMINANT_FILE_PARALLEL_THREAD_CAP);
+    (dominant_threads > 1).then_some(dominant_threads)
 }
 
 fn build_chunk_ranges(total_len: usize, chunk_size: usize) -> Vec<(usize, usize)> {
@@ -946,7 +957,12 @@ mod tests {
 
     use crate::ExpressionPlan;
 
-    use super::{auto_threads_for_shape, discover_files, run_search, SearchConfig};
+    use super::{
+        auto_threads_for_shape, discover_files, parallel_fast_count_threads, partition_roots,
+        run_search, should_stream_stats_only,
+        SearchConfig, DOMINANT_FILE_PARALLEL_THREAD_CAP, DOMINANT_FILE_PARALLEL_THRESHOLD,
+        PARALLEL_FAST_COUNT_FILE_THRESHOLD,
+    };
 
     fn unique_temp_path(prefix: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -970,6 +986,33 @@ mod tests {
     fn auto_threads_uses_parallelism_for_large_corpora_without_byte_samples() {
         assert_eq!(auto_threads_for_shape(1), 1);
         assert!(auto_threads_for_shape(2_048) >= 8);
+    }
+
+    #[test]
+    fn parallel_fast_count_threads_stays_off_for_small_or_outer_parallel_medium_files() {
+        assert_eq!(
+            parallel_fast_count_threads(PARALLEL_FAST_COUNT_FILE_THRESHOLD - 1, 1),
+            None
+        );
+        assert_eq!(
+            parallel_fast_count_threads(PARALLEL_FAST_COUNT_FILE_THRESHOLD, 8),
+            None
+        );
+    }
+
+    #[test]
+    fn parallel_fast_count_threads_enables_single_threaded_large_files() {
+        let threads = parallel_fast_count_threads(PARALLEL_FAST_COUNT_FILE_THRESHOLD, 1)
+            .expect("large single-threaded files should parallelize");
+        assert!(threads > 1);
+    }
+
+    #[test]
+    fn parallel_fast_count_threads_enables_giant_file_override_under_outer_parallelism() {
+        let threads = parallel_fast_count_threads(DOMINANT_FILE_PARALLEL_THRESHOLD, 16)
+            .expect("dominant giant files should get an inner parallel override");
+        assert!(threads > 1);
+        assert!(threads <= DOMINANT_FILE_PARALLEL_THREAD_CAP);
     }
 
     #[test]
@@ -1231,6 +1274,41 @@ mod tests {
         assert_eq!(report.stats.overlap_pruned_roots, 1);
         assert_eq!(report.stats.discovered_duplicate_paths, 0);
         assert_eq!(report.stats.acceleration_bailouts, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stats_only_streaming_gate_stays_off_for_single_root_directory_searches() {
+        let root = unique_temp_path("iex-engine-streaming-gate-single-root");
+        fs::create_dir_all(&root).expect("root dir should be created");
+        fs::write(root.join("needle.txt"), "needle here\n").expect("fixture file should write");
+
+        let plan = ExpressionPlan::parse("lit:needle").expect("plan should parse");
+        let mut config = SearchConfig::new(root.clone(), plan);
+        config.collect_hits = false;
+        let roots = partition_roots(&config);
+
+        assert!(!should_stream_stats_only(&config, &roots));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stats_only_streaming_gate_stays_on_for_multipath_even_after_overlap_pruning() {
+        let root = unique_temp_path("iex-engine-streaming-gate-multipath");
+        let child = root.join("nested");
+        fs::create_dir_all(&child).expect("child dir should be created");
+        fs::write(child.join("needle.txt"), "needle here\n").expect("fixture file should write");
+
+        let plan = ExpressionPlan::parse("lit:needle").expect("plan should parse");
+        let mut config = SearchConfig::from_roots(vec![root.clone(), child.clone()], plan);
+        config.collect_hits = false;
+        let roots = partition_roots(&config);
+
+        assert_eq!(roots.telemetry.input_roots, 2);
+        assert_eq!(roots.telemetry.effective_roots, 1);
+        assert!(should_stream_stats_only(&config, &roots));
 
         let _ = fs::remove_dir_all(root);
     }
