@@ -315,8 +315,14 @@ fn discover_files_from_targets(
     })
 }
 
+fn prefer_single_root_streaming_stats_only() -> bool {
+    !cfg!(windows)
+}
+
 fn should_stream_stats_only(config: &SearchConfig, roots: &RootTargets) -> bool {
-    !config.collect_hits && !roots.directory_roots.is_empty()
+    !config.collect_hits
+        && !roots.directory_roots.is_empty()
+        && (roots.telemetry.input_roots > 1 || prefer_single_root_streaming_stats_only())
 }
 
 fn build_walk_builder(config: &SearchConfig, roots: &[PathBuf]) -> WalkBuilder {
@@ -948,11 +954,7 @@ fn scan_loaded_bytes(
             };
 
             let raw_line = &bytes[line_start..line_end];
-            let line = if raw_line.last() == Some(&b'\r') {
-                &raw_line[..raw_line.len().saturating_sub(1)]
-            } else {
-                raw_line
-            };
+            let line = trim_trailing_cr(raw_line);
 
             line_no += 1;
             if plan.matches_bytes(line) {
@@ -1130,6 +1132,14 @@ fn build_chunk_ranges(total_len: usize, chunk_size: usize) -> Vec<(usize, usize)
     ranges
 }
 
+fn trim_trailing_cr(raw_line: &[u8]) -> &[u8] {
+    if raw_line.last() == Some(&b'\r') {
+        &raw_line[..raw_line.len().saturating_sub(1)]
+    } else {
+        raw_line
+    }
+}
+
 fn completed_outcome(
     path: &Path,
     bytes: u64,
@@ -1174,7 +1184,8 @@ mod tests {
         auto_threads_for_shape, auto_threads_for_shape_with_available,
         auto_threads_for_streaming_with_available, discover_files, dominant_parallel_thread_cap,
         parallel_fast_count_min_chunk_bytes, parallel_fast_count_plan_with_available,
-        partition_roots, run_search, should_stream_stats_only, threads_90pct, SearchConfig,
+        partition_roots, prefer_single_root_streaming_stats_only, run_search,
+        should_stream_stats_only, threads_90pct, SearchConfig,
         DOMINANT_FILE_PARALLEL_THREAD_CAP_MAX, DOMINANT_FILE_PARALLEL_THRESHOLD,
         PARALLEL_FAST_COUNT_FILE_THRESHOLD, PARALLEL_FAST_COUNT_MEDIUM_MIN_CHUNK_BYTES,
     };
@@ -1547,7 +1558,11 @@ mod tests {
         assert_eq!(stats_only.stats.acceleration_bailouts, 0);
         assert_eq!(
             stats_only.stats.concurrency.execution_mode,
-            "streaming_stats_only"
+            if prefer_single_root_streaming_stats_only() {
+                "streaming_stats_only"
+            } else {
+                "materialized"
+            }
         );
 
         let _ = fs::remove_dir_all(root);
@@ -1591,7 +1606,10 @@ mod tests {
         config.collect_hits = false;
         let roots = partition_roots(&config);
 
-        assert!(should_stream_stats_only(&config, &roots));
+        assert_eq!(
+            should_stream_stats_only(&config, &roots),
+            prefer_single_root_streaming_stats_only()
+        );
 
         let _ = fs::remove_dir_all(root);
     }
