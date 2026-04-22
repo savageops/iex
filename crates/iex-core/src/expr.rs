@@ -1,11 +1,17 @@
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use anyhow::{anyhow, Result};
-use memchr::{memchr, memchr2, memmem};
+use memchr::{memchr, memchr2, memmem, memrchr};
 use regex::{
     bytes::{Regex as BytesRegex, RegexBuilder as BytesRegexBuilder},
     Regex,
 };
+use regex_syntax::{
+    hir::{Class, ClassBytesRange, Hir, HirKind},
+    ParserBuilder as HirParserBuilder,
+};
 use serde::Serialize;
+
+use crate::stats::RegexDecompositionStats;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -33,6 +39,7 @@ enum Predicate {
         text: Regex,
         bytes: BytesRegex,
         fast_path: Option<RegexFastPath>,
+        decomposition: Option<RegexDecompositionPlan>,
     },
 }
 
@@ -68,6 +75,58 @@ enum RegexFastPath {
 }
 
 #[derive(Debug, Clone)]
+struct RegexDecompositionPlan {
+    #[allow(dead_code)]
+    literal: Vec<u8>,
+    finder: memmem::Finder<'static>,
+    context_gate: Option<RegexDecompositionContextGate>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RegexDecompositionContextGate {
+    left: Option<ContextRunGate>,
+    right: Option<ContextRunGate>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ContextRunGate {
+    separator: RequiredByteClass,
+    neighbor: RequiredByteClass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequiredByteClass {
+    Word,
+    Whitespace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FastDecompositionResult {
+    Count(DecompositionCount),
+    Bailout(DecompositionCount),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct DecompositionCount {
+    pub(crate) match_count: usize,
+    pub(crate) candidate_lines_checked: usize,
+    pub(crate) duplicate_candidate_hits_skipped: usize,
+}
+
+impl DecompositionCount {
+    pub(crate) fn telemetry(self, counted: bool, bailed_out: bool) -> RegexDecompositionStats {
+        RegexDecompositionStats {
+            eligible_files: 1,
+            counted_files: usize::from(counted),
+            bailout_files: usize::from(bailed_out),
+            candidate_lines_checked: self.candidate_lines_checked,
+            duplicate_candidate_hits_skipped: self.duplicate_candidate_hits_skipped,
+            candidate_lines_matched: self.match_count,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct AsciiCaseFoldSearcher {
     needle: Vec<u8>,
     shift: [usize; 256],
@@ -85,6 +144,8 @@ const REJECT_FAST_QUICK_PREFIX_LEN: usize = 3;
 const LITERAL_ANCHOR_MIN_LEN: usize = 4;
 const LITERAL_ANCHOR_MIN_DISTINCT_BYTES: usize = 3;
 const LITERAL_ANCHOR_STRONG_RANK_MAX: u16 = 96;
+const REGEX_DECOMPOSITION_MIN_LITERAL_LEN: usize = 4;
+const REGEX_DECOMPOSITION_MAX_CANDIDATE_LINES: usize = 4096;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -411,6 +472,24 @@ impl ExpressionPlan {
         self.fast_match_count_no_hits_bytes(haystack.as_bytes())
     }
 
+    pub(crate) fn fast_decomposition_count_no_hits_bytes(
+        &self,
+        haystack: &[u8],
+    ) -> Option<FastDecompositionResult> {
+        match self.compiled.as_slice() {
+            [Predicate::Regex {
+                bytes,
+                decomposition: Some(decomposition),
+                ..
+            }] => Some(count_regex_decomposition_candidate_lines(
+                haystack,
+                bytes,
+                decomposition,
+            )),
+            _ => None,
+        }
+    }
+
     pub fn fast_match_count_no_hits_bytes(&self, haystack: &[u8]) -> Option<usize> {
         match self.compiled.as_slice() {
             [Predicate::Regex {
@@ -422,7 +501,9 @@ impl ExpressionPlan {
                 Some(RegexFastPath::AsciiCaseFoldLiteral { searcher, .. }) => {
                     count_casefold_literal_occurrences_bytes(haystack, searcher)
                 }
-                Some(RegexFastPath::FixedWidthBytesRegex { .. }) => bytes.find_iter(haystack).count(),
+                Some(RegexFastPath::FixedWidthBytesRegex { .. }) => {
+                    bytes.find_iter(haystack).count()
+                }
                 Some(RegexFastPath::WordBoundaryLiteral { literal, finder }) => {
                     count_word_boundary_literal_occurrences_bytes(haystack, literal, finder)
                 }
@@ -476,15 +557,15 @@ impl ExpressionPlan {
                         bounded_end,
                     ))
                 }
-                Some(RegexFastPath::FixedWidthBytesRegex { match_len }) => Some(
-                    count_fixed_width_regex_occurrences_bytes_in_range(
+                Some(RegexFastPath::FixedWidthBytesRegex { match_len }) => {
+                    Some(count_fixed_width_regex_occurrences_bytes_in_range(
                         haystack,
                         bytes,
                         *match_len,
                         start,
                         bounded_end,
-                    ),
-                ),
+                    ))
+                }
                 Some(RegexFastPath::WordBoundaryLiteral { literal, finder }) => {
                     Some(count_word_boundary_literal_occurrences_bytes_in_range(
                         haystack,
@@ -539,11 +620,13 @@ fn parse_token(token: &str) -> Result<(Predicate, PredicateDescriptor)> {
             .build()
             .map_err(|err| anyhow!("invalid regex token '{value}': {err}"))?;
         let fast_path = classify_regex_fast_path(value);
+        let decomposition = classify_regex_decomposition(value, fast_path.as_ref());
         return Ok((
             Predicate::Regex {
                 text,
                 bytes,
                 fast_path,
+                decomposition,
             },
             PredicateDescriptor::Regex(value.to_owned()),
         ));
@@ -732,11 +815,318 @@ fn classify_regex_fast_path(pattern: &str) -> Option<RegexFastPath> {
     })
 }
 
+fn classify_regex_decomposition(
+    pattern: &str,
+    fast_path: Option<&RegexFastPath>,
+) -> Option<RegexDecompositionPlan> {
+    if fast_path.is_some() {
+        return None;
+    }
+
+    let hir = HirParserBuilder::new()
+        .utf8(false)
+        .unicode(false)
+        .build()
+        .parse(pattern)
+        .ok()?;
+    let literal = strongest_required_literal(&hir)?;
+    if literal.len() < REGEX_DECOMPOSITION_MIN_LITERAL_LEN {
+        return None;
+    }
+    let context_gate = find_literal_context_gate(&hir, &literal);
+
+    Some(RegexDecompositionPlan {
+        finder: owned_finder(&literal),
+        literal,
+        context_gate,
+    })
+}
+
+fn strongest_required_literal(hir: &Hir) -> Option<Vec<u8>> {
+    match hir.kind() {
+        HirKind::Empty | HirKind::Class(_) | HirKind::Look(_) => None,
+        HirKind::Literal(literal) => Some(literal.0.to_vec()),
+        HirKind::Capture(capture) => strongest_required_literal(&capture.sub),
+        HirKind::Repetition(repetition) => {
+            if repetition.min == 0 {
+                None
+            } else {
+                strongest_required_literal(&repetition.sub)
+            }
+        }
+        HirKind::Concat(parts) => parts
+            .iter()
+            .filter_map(strongest_required_literal)
+            .reduce(select_stronger_required_literal),
+        HirKind::Alternation(parts) => {
+            let mut candidates = parts.iter().map(strongest_required_literal);
+            let first = candidates.next()??;
+            if candidates.all(|candidate| candidate.as_deref() == Some(first.as_slice())) {
+                Some(first)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn select_stronger_required_literal(left: Vec<u8>, right: Vec<u8>) -> Vec<u8> {
+    if right.len() > left.len() {
+        right
+    } else {
+        left
+    }
+}
+
 fn split_case_insensitive_prefix(pattern: &str) -> (bool, &str) {
     if let Some(rest) = pattern.strip_prefix("(?i)") {
         return (true, rest);
     }
     (false, pattern)
+}
+
+fn count_regex_decomposition_candidate_lines(
+    haystack: &[u8],
+    regex: &BytesRegex,
+    decomposition: &RegexDecompositionPlan,
+) -> FastDecompositionResult {
+    let mut last_line_start = None;
+    let mut counts = DecompositionCount::default();
+
+    for candidate_start in decomposition.finder.find_iter(haystack) {
+        let candidate_end = candidate_start + decomposition.literal.len();
+        if !candidate_satisfies_context_gate(
+            haystack,
+            candidate_start,
+            candidate_end,
+            decomposition.context_gate,
+        ) {
+            continue;
+        }
+
+        let line_start = line_start_for_offset(haystack, candidate_start);
+        if last_line_start == Some(line_start) {
+            counts.duplicate_candidate_hits_skipped += 1;
+            continue;
+        }
+
+        if counts.candidate_lines_checked == REGEX_DECOMPOSITION_MAX_CANDIDATE_LINES {
+            return FastDecompositionResult::Bailout(counts);
+        }
+
+        counts.candidate_lines_checked += 1;
+        let line_end = line_end_for_offset(haystack, candidate_start);
+        let line = trim_trailing_carriage_return(&haystack[line_start..line_end]);
+        if regex.is_match(line) {
+            counts.match_count += 1;
+        }
+        last_line_start = Some(line_start);
+    }
+
+    FastDecompositionResult::Count(counts)
+}
+
+fn find_literal_context_gate(hir: &Hir, literal: &[u8]) -> Option<RegexDecompositionContextGate> {
+    match hir.kind() {
+        HirKind::Capture(capture) => find_literal_context_gate(&capture.sub, literal),
+        HirKind::Repetition(repetition) if repetition.min > 0 => {
+            find_literal_context_gate(&repetition.sub, literal)
+        }
+        HirKind::Concat(parts) => {
+            for (idx, part) in parts.iter().enumerate() {
+                if !hir_is_literal_bytes(part, literal) {
+                    continue;
+                }
+
+                let gate = RegexDecompositionContextGate {
+                    left: extract_left_context_gate(&parts[..idx]),
+                    right: extract_right_context_gate(&parts[idx + 1..]),
+                };
+                if gate.left.is_some() || gate.right.is_some() {
+                    return Some(gate);
+                }
+            }
+
+            parts
+                .iter()
+                .find_map(|part| find_literal_context_gate(part, literal))
+        }
+        HirKind::Alternation(parts) => parts
+            .iter()
+            .find_map(|part| find_literal_context_gate(part, literal)),
+        _ => None,
+    }
+}
+
+fn hir_is_literal_bytes(hir: &Hir, literal: &[u8]) -> bool {
+    match hir.kind() {
+        HirKind::Literal(candidate) => candidate.0.as_ref() == literal,
+        HirKind::Capture(capture) => hir_is_literal_bytes(&capture.sub, literal),
+        HirKind::Repetition(repetition) if repetition.min > 0 => {
+            hir_is_literal_bytes(&repetition.sub, literal)
+        }
+        _ => false,
+    }
+}
+
+fn extract_left_context_gate(parts: &[Hir]) -> Option<ContextRunGate> {
+    let separator = parts.last().and_then(required_byte_class)?;
+    let neighbor = parts
+        .get(parts.len().checked_sub(2)?)
+        .and_then(required_byte_class)?;
+    Some(ContextRunGate {
+        separator,
+        neighbor,
+    })
+}
+
+fn extract_right_context_gate(parts: &[Hir]) -> Option<ContextRunGate> {
+    let separator = parts.first().and_then(required_byte_class)?;
+    let neighbor = parts.get(1).and_then(required_byte_class)?;
+    Some(ContextRunGate {
+        separator,
+        neighbor,
+    })
+}
+
+fn required_byte_class(hir: &Hir) -> Option<RequiredByteClass> {
+    match hir.kind() {
+        HirKind::Class(class) => classify_hir_class(class),
+        HirKind::Capture(capture) => required_byte_class(&capture.sub),
+        HirKind::Repetition(repetition) if repetition.min > 0 => {
+            required_byte_class(&repetition.sub)
+        }
+        _ => None,
+    }
+}
+
+fn classify_hir_class(class: &Class) -> Option<RequiredByteClass> {
+    match class {
+        Class::Bytes(bytes) => classify_byte_class_ranges(bytes.ranges()),
+        Class::Unicode(unicode) => {
+            let bytes = unicode.to_byte_class()?;
+            classify_byte_class_ranges(bytes.ranges())
+        }
+    }
+}
+
+fn classify_byte_class_ranges(ranges: &[ClassBytesRange]) -> Option<RequiredByteClass> {
+    let ranges: Vec<(u8, u8)> = ranges
+        .iter()
+        .map(|range| (range.start(), range.end()))
+        .collect();
+    match ranges.as_slice() {
+        [(b'0', b'9'), (b'A', b'Z'), (b'_', b'_'), (b'a', b'z')] => Some(RequiredByteClass::Word),
+        [(b'\t', b'\r'), (b' ', b' ')] => Some(RequiredByteClass::Whitespace),
+        [(b'\t', b'\t'), (b'\n', b'\n'), (0x0B, 0x0B), (0x0C, 0x0C), (b'\r', b'\r'), (b' ', b' ')] => {
+            Some(RequiredByteClass::Whitespace)
+        }
+        _ => None,
+    }
+}
+
+fn candidate_satisfies_context_gate(
+    haystack: &[u8],
+    start: usize,
+    end: usize,
+    gate: Option<RegexDecompositionContextGate>,
+) -> bool {
+    let Some(gate) = gate else {
+        return true;
+    };
+
+    gate.left
+        .is_none_or(|left| candidate_satisfies_left_context_gate(haystack, start, left))
+        && gate
+            .right
+            .is_none_or(|right| candidate_satisfies_right_context_gate(haystack, end, right))
+}
+
+fn candidate_satisfies_left_context_gate(
+    haystack: &[u8],
+    start: usize,
+    gate: ContextRunGate,
+) -> bool {
+    if start == 0 {
+        return false;
+    }
+
+    let mut cursor = start - 1;
+    let byte = haystack[cursor];
+    if byte == b'\n' || !byte_matches_required_class(byte, gate.separator) {
+        return false;
+    }
+
+    loop {
+        if cursor == 0 {
+            return false;
+        }
+        cursor -= 1;
+        let byte = haystack[cursor];
+        if byte == b'\n' {
+            return false;
+        }
+        if !byte_matches_required_class(byte, gate.separator) {
+            return byte_matches_required_class(byte, gate.neighbor);
+        }
+    }
+}
+
+fn candidate_satisfies_right_context_gate(
+    haystack: &[u8],
+    end: usize,
+    gate: ContextRunGate,
+) -> bool {
+    if end >= haystack.len() {
+        return false;
+    }
+
+    let mut cursor = end;
+    let byte = haystack[cursor];
+    if byte == b'\n' || !byte_matches_required_class(byte, gate.separator) {
+        return false;
+    }
+
+    loop {
+        cursor += 1;
+        if cursor >= haystack.len() {
+            return false;
+        }
+        let byte = haystack[cursor];
+        if byte == b'\n' {
+            return false;
+        }
+        if !byte_matches_required_class(byte, gate.separator) {
+            return byte_matches_required_class(byte, gate.neighbor);
+        }
+    }
+}
+
+fn byte_matches_required_class(byte: u8, class: RequiredByteClass) -> bool {
+    match class {
+        RequiredByteClass::Word => byte.is_ascii_alphanumeric() || byte == b'_',
+        RequiredByteClass::Whitespace => matches!(byte, b' ' | b'\t' | b'\r' | 0x0B | 0x0C),
+    }
+}
+
+fn line_start_for_offset(haystack: &[u8], offset: usize) -> usize {
+    memrchr(b'\n', &haystack[..offset])
+        .map(|index| index + 1)
+        .unwrap_or(0)
+}
+
+fn line_end_for_offset(haystack: &[u8], offset: usize) -> usize {
+    memchr(b'\n', &haystack[offset..])
+        .map(|index| offset + index)
+        .unwrap_or(haystack.len())
+}
+
+fn trim_trailing_carriage_return(line: &[u8]) -> &[u8] {
+    if line.last() == Some(&b'\r') {
+        &line[..line.len().saturating_sub(1)]
+    } else {
+        line
+    }
 }
 
 fn parse_word_boundary_literal(pattern: &str) -> Option<String> {
@@ -1216,7 +1606,9 @@ fn count_alternate_literal_occurrences_bytes_in_range(
 
 #[cfg(test)]
 mod tests {
-    use super::{ExpressionPlan, Predicate, RegexFastPath};
+    use super::{
+        DecompositionCount, ExpressionPlan, FastDecompositionResult, Predicate, RegexFastPath,
+    };
 
     fn regex_fast_path(plan: &ExpressionPlan) -> Option<&RegexFastPath> {
         match plan.compiled.as_slice() {
@@ -1243,6 +1635,28 @@ mod tests {
         }
     }
 
+    fn decomposition_literal(plan: &ExpressionPlan) -> Option<&[u8]> {
+        match plan.compiled.as_slice() {
+            [Predicate::Regex {
+                decomposition: Some(decomposition),
+                ..
+            }] => Some(decomposition.literal.as_slice()),
+            _ => None,
+        }
+    }
+
+    fn decomposition_context_gate(plan: &ExpressionPlan) -> Option<(bool, bool)> {
+        match plan.compiled.as_slice() {
+            [Predicate::Regex {
+                decomposition: Some(decomposition),
+                ..
+            }] => decomposition
+                .context_gate
+                .map(|gate| (gate.left.is_some(), gate.right.is_some())),
+            _ => None,
+        }
+    }
+
     #[test]
     fn alternates_plan_disables_outer_parallel_shard_fast_count() {
         let plan = ExpressionPlan::parse(r"re:(ERR_SYS|PME_TURN_OFF)").expect("plan should parse");
@@ -1259,6 +1673,33 @@ mod tests {
     fn plain_literal_plan_keeps_outer_parallel_shard_fast_count() {
         let plan = ExpressionPlan::parse(r"re:PM_RESUME").expect("plan should parse");
         assert!(plan.supports_outer_parallel_shard_fast_count());
+    }
+
+    #[test]
+    fn regex_decomposition_extracts_required_inner_literal() {
+        let plan = ExpressionPlan::parse(r"re:\w+\s+Holmes\s+\w+").expect("plan should parse");
+        assert_eq!(decomposition_literal(&plan), Some("Holmes".as_bytes()));
+        assert_eq!(decomposition_context_gate(&plan), Some((true, true)));
+    }
+
+    #[test]
+    fn regex_decomposition_stays_off_without_required_literal() {
+        let plan = ExpressionPlan::parse(r"re:\w{5}\s+\w{5}\s+\w{5}").expect("plan should parse");
+        assert_eq!(decomposition_literal(&plan), None);
+    }
+
+    #[test]
+    fn regex_decomposition_counts_matching_lines_once_per_line() {
+        let plan = ExpressionPlan::parse(r"re:\w+\s+Holmes\s+\w+").expect("plan should parse");
+        let haystack = b"aa Holmes bb\r\nxx Holmes yy Holmes zz\nHolmes\n";
+        assert_eq!(
+            plan.fast_decomposition_count_no_hits_bytes(haystack),
+            Some(FastDecompositionResult::Count(DecompositionCount {
+                match_count: 2,
+                candidate_lines_checked: 2,
+                duplicate_candidate_hits_skipped: 1,
+            }))
+        );
     }
 
     #[test]

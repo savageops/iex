@@ -18,7 +18,10 @@ use memmap2::MmapOptions;
 use rayon::prelude::*;
 use serde::Serialize;
 
-use crate::{expr::ExpressionPlan, stats::SearchStats};
+use crate::{
+    expr::{ExpressionPlan, FastDecompositionResult},
+    stats::{RegexDecompositionStats, SearchStats},
+};
 
 const TINY_FILE_INLINE_LIMIT: usize = 16 * 1024;
 const SMALL_FILE_INLINE_LIMIT: u64 = 256 * 1024;
@@ -64,6 +67,8 @@ struct FileScanOutcome {
     bytes: u64,
     hits: Vec<SearchHit>,
     match_count: usize,
+    acceleration_bailouts: usize,
+    regex_decomposition: RegexDecompositionStats,
     scanned: bool,
     shard_plan: Option<ParallelShardPlan>,
 }
@@ -801,6 +806,8 @@ fn merge_outcome(
     if outcome.scanned {
         stats.files_scanned += 1;
         stats.bytes_scanned += outcome.bytes;
+        stats.acceleration_bailouts += outcome.acceleration_bailouts;
+        stats.observe_regex_decomposition(outcome.regex_decomposition);
         stats.consider_slow_file(&outcome.path, outcome.duration_ms, outcome.bytes);
         stats.matches_found += outcome.match_count;
         if let Some(shard_plan) = outcome.shard_plan {
@@ -924,6 +931,8 @@ fn scan_loaded_bytes(
 
     let mut hits = Vec::new();
     let mut match_count = 0usize;
+    let mut acceleration_bailouts = 0usize;
+    let mut regex_decomposition = RegexDecompositionStats::default();
     let mut cached_path = None::<String>;
 
     if !collect_hits {
@@ -931,11 +940,47 @@ fn scan_loaded_bytes(
             maybe_parallel_fast_count_bytes(plan, bytes, concurrency, outer_scan_threads)
         {
             match_count = count;
-            return completed_outcome(path, file_bytes, hits, match_count, Some(shard_plan));
+            return completed_outcome(
+                path,
+                file_bytes,
+                hits,
+                match_count,
+                acceleration_bailouts,
+                regex_decomposition,
+                Some(shard_plan),
+            );
+        }
+        match plan.fast_decomposition_count_no_hits_bytes(bytes) {
+            Some(FastDecompositionResult::Count(counts)) => {
+                match_count = counts.match_count;
+                regex_decomposition = counts.telemetry(true, false);
+                return completed_outcome(
+                    path,
+                    file_bytes,
+                    hits,
+                    match_count,
+                    acceleration_bailouts,
+                    regex_decomposition,
+                    None,
+                );
+            }
+            Some(FastDecompositionResult::Bailout(counts)) => {
+                acceleration_bailouts += 1;
+                regex_decomposition = counts.telemetry(false, true);
+            }
+            None => {}
         }
         if let Some(count) = plan.fast_match_count_no_hits_bytes(bytes) {
             match_count = count;
-            return completed_outcome(path, file_bytes, hits, match_count, None);
+            return completed_outcome(
+                path,
+                file_bytes,
+                hits,
+                match_count,
+                acceleration_bailouts,
+                regex_decomposition,
+                None,
+            );
         }
     }
 
@@ -981,7 +1026,15 @@ fn scan_loaded_bytes(
         if !collect_hits {
             if let Some(count) = plan.fast_match_count_no_hits(&text) {
                 match_count = count;
-                return completed_outcome(path, file_bytes, hits, match_count, None);
+                return completed_outcome(
+                    path,
+                    file_bytes,
+                    hits,
+                    match_count,
+                    acceleration_bailouts,
+                    regex_decomposition,
+                    None,
+                );
             }
         }
 
@@ -1003,7 +1056,15 @@ fn scan_loaded_bytes(
         }
     }
 
-    completed_outcome(path, file_bytes, hits, match_count, None)
+    completed_outcome(
+        path,
+        file_bytes,
+        hits,
+        match_count,
+        acceleration_bailouts,
+        regex_decomposition,
+        None,
+    )
 }
 
 fn is_likely_binary(bytes: &[u8]) -> bool {
@@ -1145,6 +1206,8 @@ fn completed_outcome(
     bytes: u64,
     hits: Vec<SearchHit>,
     match_count: usize,
+    acceleration_bailouts: usize,
+    regex_decomposition: RegexDecompositionStats,
     shard_plan: Option<ParallelShardPlan>,
 ) -> FileScanOutcome {
     FileScanOutcome {
@@ -1153,6 +1216,8 @@ fn completed_outcome(
         bytes,
         hits,
         match_count,
+        acceleration_bailouts,
+        regex_decomposition,
         scanned: true,
         shard_plan,
     }
@@ -1165,6 +1230,8 @@ fn failed_outcome(path: &Path, bytes: u64) -> FileScanOutcome {
         bytes,
         hits: Vec::new(),
         match_count: 0,
+        acceleration_bailouts: 0,
+        regex_decomposition: RegexDecompositionStats::default(),
         scanned: false,
         shard_plan: None,
     }
@@ -1566,6 +1633,77 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn regex_decomposition_stats_only_matches_collecting_totals() {
+        let file = unique_temp_path("iex-engine-regex-decomposition").with_extension("txt");
+        fs::write(&file, "aa Holmes bb\nxx Holmes yy Holmes zz\nHolmes\n")
+            .expect("regex fixture should write");
+
+        let plan = ExpressionPlan::parse(r"re:\w+\s+Holmes\s+\w+").expect("plan should parse");
+        let collecting =
+            run_search(&SearchConfig::new(file.clone(), plan.clone())).expect("collecting search");
+
+        let mut stats_only_config = SearchConfig::new(file.clone(), plan);
+        stats_only_config.collect_hits = false;
+        let stats_only = run_search(&stats_only_config).expect("stats-only search");
+
+        assert!(stats_only.hits.is_empty());
+        assert_eq!(
+            stats_only.stats.matches_found,
+            collecting.stats.matches_found
+        );
+        assert_eq!(stats_only.stats.matches_found, 2);
+        assert_eq!(stats_only.stats.acceleration_bailouts, 0);
+        assert_eq!(stats_only.stats.regex_decomposition.eligible_files, 1);
+        assert_eq!(stats_only.stats.regex_decomposition.counted_files, 1);
+        assert_eq!(stats_only.stats.regex_decomposition.bailout_files, 0);
+        assert_eq!(
+            stats_only.stats.regex_decomposition.candidate_lines_checked,
+            2
+        );
+        assert_eq!(
+            stats_only
+                .stats
+                .regex_decomposition
+                .duplicate_candidate_hits_skipped,
+            1
+        );
+        assert_eq!(
+            stats_only.stats.regex_decomposition.candidate_lines_matched,
+            2
+        );
+
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn regex_decomposition_bails_out_when_candidate_lines_explode() {
+        let file = unique_temp_path("iex-engine-regex-decomposition-bailout").with_extension("txt");
+        let contents = "aa Holmes bb\n".repeat(5_000);
+        fs::write(&file, contents).expect("bailout fixture should write");
+
+        let plan = ExpressionPlan::parse(r"re:\w+\s+Holmes\s+\w+").expect("plan should parse");
+        let mut stats_only_config = SearchConfig::new(file.clone(), plan);
+        stats_only_config.collect_hits = false;
+        let stats_only = run_search(&stats_only_config).expect("stats-only search");
+
+        assert_eq!(stats_only.stats.matches_found, 5_000);
+        assert_eq!(stats_only.stats.acceleration_bailouts, 1);
+        assert_eq!(stats_only.stats.regex_decomposition.eligible_files, 1);
+        assert_eq!(stats_only.stats.regex_decomposition.counted_files, 0);
+        assert_eq!(stats_only.stats.regex_decomposition.bailout_files, 1);
+        assert_eq!(
+            stats_only.stats.regex_decomposition.candidate_lines_checked,
+            4_096
+        );
+        assert_eq!(
+            stats_only.stats.regex_decomposition.candidate_lines_matched,
+            4_096
+        );
+
+        let _ = fs::remove_file(file);
     }
 
     #[test]

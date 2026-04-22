@@ -44,6 +44,16 @@ impl Default for ConcurrencyStats {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+pub struct RegexDecompositionStats {
+    pub eligible_files: usize,
+    pub counted_files: usize,
+    pub bailout_files: usize,
+    pub candidate_lines_checked: usize,
+    pub duplicate_candidate_hits_skipped: usize,
+    pub candidate_lines_matched: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchStats {
     pub input_roots: usize,
@@ -57,6 +67,7 @@ pub struct SearchStats {
     pub files_skipped: usize,
     pub matches_found: usize,
     pub bytes_scanned: u64,
+    pub regex_decomposition: RegexDecompositionStats,
     pub timings: PhaseTimings,
     pub concurrency: ConcurrencyStats,
     pub slowest_files: Vec<SlowFileStat>,
@@ -76,6 +87,7 @@ impl Default for SearchStats {
             files_skipped: 0,
             matches_found: 0,
             bytes_scanned: 0,
+            regex_decomposition: RegexDecompositionStats::default(),
             timings: PhaseTimings::default(),
             concurrency: ConcurrencyStats::default(),
             slowest_files: Vec::new(),
@@ -108,6 +120,16 @@ impl SearchStats {
         self.concurrency.max_shard_ranges = self.concurrency.max_shard_ranges.max(range_count);
         self.concurrency.max_shard_chunk_bytes =
             self.concurrency.max_shard_chunk_bytes.max(chunk_bytes);
+    }
+
+    pub fn observe_regex_decomposition(&mut self, telemetry: RegexDecompositionStats) {
+        self.regex_decomposition.eligible_files += telemetry.eligible_files;
+        self.regex_decomposition.counted_files += telemetry.counted_files;
+        self.regex_decomposition.bailout_files += telemetry.bailout_files;
+        self.regex_decomposition.candidate_lines_checked += telemetry.candidate_lines_checked;
+        self.regex_decomposition.duplicate_candidate_hits_skipped +=
+            telemetry.duplicate_candidate_hits_skipped;
+        self.regex_decomposition.candidate_lines_matched += telemetry.candidate_lines_matched;
     }
 
     pub fn consider_slow_file(&mut self, path: &Path, duration_ms: f64, bytes: u64) {
