@@ -1,6 +1,7 @@
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use anyhow::{anyhow, Result};
 use memchr::{memchr, memchr2, memmem, memrchr};
+use rayon::prelude::*;
 use regex::{
     bytes::{Regex as BytesRegex, RegexBuilder as BytesRegexBuilder},
     Regex,
@@ -11,7 +12,7 @@ use regex_syntax::{
 };
 use serde::Serialize;
 
-use crate::stats::RegexDecompositionStats;
+use crate::stats::{FastCountDensityStats, RegexDecompositionStats, UnicodeCaseFoldPrefilterStats};
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -122,6 +123,23 @@ impl DecompositionCount {
             candidate_lines_checked: self.candidate_lines_checked,
             duplicate_candidate_hits_skipped: self.duplicate_candidate_hits_skipped,
             candidate_lines_matched: self.match_count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FastCountOutcome {
+    pub count: usize,
+    pub unicode_casefold_prefilter: UnicodeCaseFoldPrefilterStats,
+    pub fast_count_density: FastCountDensityStats,
+}
+
+impl FastCountOutcome {
+    fn from_count(count: usize) -> Self {
+        Self {
+            count,
+            unicode_casefold_prefilter: UnicodeCaseFoldPrefilterStats::default(),
+            fast_count_density: FastCountDensityStats::default(),
         }
     }
 }
@@ -425,6 +443,49 @@ impl ExpressionPlan {
         )
     }
 
+    pub fn supports_large_directory_streaming_selector(&self) -> bool {
+        self.supports_byte_mode() && self.supports_parallel_fast_count_ranges()
+    }
+
+    pub fn supports_parallel_fast_count_ranges(&self) -> bool {
+        matches!(
+            self.compiled.as_slice(),
+            [Predicate::Literal { .. }]
+                | [Predicate::Regex {
+                    fast_path: Some(
+                        RegexFastPath::PlainLiteral { .. }
+                            | RegexFastPath::AsciiCaseFoldLiteral { .. }
+                            | RegexFastPath::WordBoundaryLiteral { .. }
+                            | RegexFastPath::AsciiCaseFoldWordBoundaryLiteral { .. }
+                            | RegexFastPath::LiteralAlternates { .. }
+                    ),
+                    ..
+                }]
+        ) || matches!(
+            self.compiled.as_slice(),
+            [Predicate::Regex {
+                fast_path: Some(RegexFastPath::FixedWidthBytesRegex { .. }),
+                ..
+            }] if unicode_case_insensitive_plain_literal_source(&self.source).is_none()
+        )
+    }
+
+    pub fn uses_single_literal_counter(&self) -> bool {
+        matches!(
+            self.compiled.as_slice(),
+            [Predicate::Literal { .. }]
+                | [Predicate::Regex {
+                    fast_path: Some(
+                        RegexFastPath::PlainLiteral { .. }
+                            | RegexFastPath::AsciiCaseFoldLiteral { .. }
+                            | RegexFastPath::WordBoundaryLiteral { .. }
+                            | RegexFastPath::AsciiCaseFoldWordBoundaryLiteral { .. }
+                    ),
+                    ..
+                }]
+        )
+    }
+
     pub fn matches_bytes(&self, haystack: &[u8]) -> bool {
         match self.mode {
             LogicMode::All => self
@@ -490,6 +551,26 @@ impl ExpressionPlan {
         }
     }
 
+    pub(crate) fn fast_decomposition_count_no_hits_bytes_sharded(
+        &self,
+        haystack: &[u8],
+        ranges: &[(usize, usize)],
+    ) -> Option<FastDecompositionResult> {
+        match self.compiled.as_slice() {
+            [Predicate::Regex {
+                bytes,
+                decomposition: Some(decomposition),
+                ..
+            }] => Some(count_regex_decomposition_candidate_lines_sharded(
+                haystack,
+                bytes,
+                decomposition,
+                ranges,
+            )),
+            _ => None,
+        }
+    }
+
     pub fn fast_match_count_no_hits_bytes(&self, haystack: &[u8]) -> Option<usize> {
         match self.compiled.as_slice() {
             [Predicate::Regex {
@@ -523,6 +604,27 @@ impl ExpressionPlan {
             }
             _ => None,
         }
+    }
+
+    pub fn fast_match_count_no_hits_bytes_with_stats(
+        &self,
+        haystack: &[u8],
+    ) -> Option<FastCountOutcome> {
+        if let [Predicate::Regex {
+            text,
+            fast_path: Some(RegexFastPath::FixedWidthBytesRegex { .. }),
+            ..
+        }] = self.compiled.as_slice()
+        {
+            if let Some(literal) = unicode_case_insensitive_plain_literal_source(&self.source) {
+                return Some(count_unicode_casefold_literal_occurrences_with_stats(
+                    haystack, text, literal,
+                ));
+            }
+        }
+
+        self.fast_match_count_no_hits_bytes(haystack)
+            .map(FastCountOutcome::from_count)
     }
 
     pub fn fast_match_count_no_hits_bytes_in_range(
@@ -607,6 +709,16 @@ impl ExpressionPlan {
             }
             _ => None,
         }
+    }
+
+    pub fn fast_match_count_no_hits_bytes_in_range_with_stats(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+    ) -> Option<FastCountOutcome> {
+        self.fast_match_count_no_hits_bytes_in_range(haystack, start, end)
+            .map(FastCountOutcome::from_count)
     }
 }
 
@@ -885,6 +997,64 @@ fn split_case_insensitive_prefix(pattern: &str) -> (bool, &str) {
     (false, pattern)
 }
 
+fn unicode_case_insensitive_plain_literal_source(source: &str) -> Option<&str> {
+    let pattern = source.strip_prefix("re:")?;
+    let (case_insensitive, core_pattern) = split_case_insensitive_prefix(pattern);
+    (case_insensitive
+        && !core_pattern.is_ascii()
+        && is_plain_literal(core_pattern)
+        && has_stable_casefold_match_width(core_pattern))
+    .then_some(core_pattern)
+}
+
+fn count_unicode_casefold_literal_occurrences_with_stats(
+    haystack: &[u8],
+    regex: &Regex,
+    literal: &str,
+) -> FastCountOutcome {
+    let haystack = String::from_utf8_lossy(haystack);
+    let count = regex.find_iter(&haystack).count();
+    let candidate_prefix_hits = literal
+        .chars()
+        .next()
+        .map(|prefix| {
+            haystack
+                .chars()
+                .filter(|candidate| {
+                    candidate.eq_ignore_ascii_case(&prefix) || {
+                        let mut candidate_lower = candidate.to_lowercase();
+                        let mut prefix_lower = prefix.to_lowercase();
+                        candidate_lower.next() == prefix_lower.next()
+                            && candidate_lower.next().is_none()
+                            && prefix_lower.next().is_none()
+                    }
+                })
+                .count()
+        })
+        .unwrap_or_default();
+    let rejected_candidates = candidate_prefix_hits.saturating_sub(count);
+
+    FastCountOutcome {
+        count,
+        unicode_casefold_prefilter: UnicodeCaseFoldPrefilterStats {
+            full_scan_calls: 1,
+            candidate_prefix_hits,
+            candidate_windows_verified: candidate_prefix_hits,
+            confirmed_matches: count,
+            rejected_candidates,
+            max_prefix_variant_count: 32,
+            max_prefix_len: literal
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or_default(),
+            max_match_len: literal.len(),
+            ..UnicodeCaseFoldPrefilterStats::default()
+        },
+        fast_count_density: FastCountDensityStats::default(),
+    }
+}
+
 fn count_regex_decomposition_candidate_lines(
     haystack: &[u8],
     regex: &BytesRegex,
@@ -924,6 +1094,94 @@ fn count_regex_decomposition_candidate_lines(
     }
 
     FastDecompositionResult::Count(counts)
+}
+
+fn count_regex_decomposition_candidate_lines_sharded(
+    haystack: &[u8],
+    regex: &BytesRegex,
+    decomposition: &RegexDecompositionPlan,
+    ranges: &[(usize, usize)],
+) -> FastDecompositionResult {
+    if ranges.len() <= 1 {
+        return count_regex_decomposition_candidate_lines(haystack, regex, decomposition);
+    }
+
+    let mut line_starts: Vec<usize> = ranges
+        .par_iter()
+        .flat_map_iter(|(start, end)| {
+            collect_regex_decomposition_candidate_line_starts_in_range(
+                haystack,
+                decomposition,
+                *start,
+                *end,
+            )
+        })
+        .collect();
+
+    let raw_candidate_line_count = line_starts.len();
+    line_starts.sort_unstable();
+    line_starts.dedup();
+
+    let mut counts = DecompositionCount {
+        duplicate_candidate_hits_skipped: raw_candidate_line_count
+            .saturating_sub(line_starts.len()),
+        ..DecompositionCount::default()
+    };
+
+    if line_starts.len() > REGEX_DECOMPOSITION_MAX_CANDIDATE_LINES {
+        counts.candidate_lines_checked = REGEX_DECOMPOSITION_MAX_CANDIDATE_LINES;
+        return FastDecompositionResult::Bailout(counts);
+    }
+
+    counts.candidate_lines_checked = line_starts.len();
+    for line_start in line_starts {
+        let line_end = line_end_for_offset(haystack, line_start);
+        let line = trim_trailing_carriage_return(&haystack[line_start..line_end]);
+        if regex.is_match(line) {
+            counts.match_count += 1;
+        }
+    }
+
+    FastDecompositionResult::Count(counts)
+}
+
+fn collect_regex_decomposition_candidate_line_starts_in_range(
+    haystack: &[u8],
+    decomposition: &RegexDecompositionPlan,
+    start: usize,
+    end: usize,
+) -> Vec<usize> {
+    let owned_start = start.min(haystack.len());
+    let owned_end = end.min(haystack.len());
+    if owned_start >= owned_end {
+        return Vec::new();
+    }
+
+    let scan_end = owned_end
+        .saturating_add(decomposition.literal.len().saturating_sub(1))
+        .min(haystack.len());
+
+    let mut line_starts = Vec::new();
+    for relative_start in decomposition
+        .finder
+        .find_iter(&haystack[owned_start..scan_end])
+    {
+        let candidate_start = owned_start + relative_start;
+        if candidate_start >= owned_end {
+            continue;
+        }
+        let candidate_end = candidate_start + decomposition.literal.len();
+        if !candidate_satisfies_context_gate(
+            haystack,
+            candidate_start,
+            candidate_end,
+            decomposition.context_gate,
+        ) {
+            continue;
+        }
+        line_starts.push(line_start_for_offset(haystack, candidate_start));
+    }
+    line_starts
 }
 
 fn find_literal_context_gate(hir: &Hir, literal: &[u8]) -> Option<RegexDecompositionContextGate> {

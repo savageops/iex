@@ -11,3 +11,11 @@ clap.workspace = true
 regex.workspace = true
 serde_json.workspace = true
 iex-core = { path = "../iex-core" }
+
+[[bin]]
+name = "ix"
+path = "src/main.rs"
+
+[[bin]]
+name = "iex-cli"
+path = "src/main.rs"

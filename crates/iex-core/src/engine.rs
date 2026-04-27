@@ -1,16 +1,17 @@
 use std::{
-    collections::BTreeSet,
+    cmp::Ordering as CmpOrdering,
+    collections::{BTreeSet, HashMap},
     fs::File,
     io::Read,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     time::Instant,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use crossbeam_channel as channel;
 use ignore::{WalkBuilder, WalkState};
 use memchr::memchr;
@@ -19,8 +20,11 @@ use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::{
-    expr::{ExpressionPlan, FastDecompositionResult},
-    stats::{RegexDecompositionStats, SearchStats},
+    expr::{ExpressionPlan, FastCountOutcome, FastDecompositionResult},
+    stats::{
+        FastCountDensityStats, LinuxStrategyStats, RegexDecompositionStats, SearchStats,
+        UnicodeCaseFoldPrefilterStats,
+    },
 };
 
 const TINY_FILE_INLINE_LIMIT: usize = 16 * 1024;
@@ -30,9 +34,28 @@ const PARALLEL_FAST_COUNT_FILE_THRESHOLD: usize = 16 * 1024 * 1024;
 const PARALLEL_FAST_COUNT_MEDIUM_MIN_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const PARALLEL_FAST_COUNT_DOMINANT_MIN_CHUNK_BYTES: usize = 32 * 1024 * 1024;
 const PARALLEL_FAST_COUNT_TARGET_RANGES_PER_THREAD: usize = 2;
+const PARALLEL_FAST_COUNT_OUTER_LITERAL_MEDIUM_THREAD_CAP: usize = 2;
+const REGEX_DECOMPOSITION_PARALLEL_FILE_THRESHOLD: usize = 64 * 1024 * 1024;
+const REGEX_DECOMPOSITION_PARALLEL_MAX_SHARD_THREADS: usize = 2;
 const DOMINANT_FILE_PARALLEL_THRESHOLD: usize = 512 * 1024 * 1024;
 const DOMINANT_FILE_PARALLEL_THREAD_CAP_MAX: usize = 12;
 const STREAMING_PATH_QUEUE_MULTIPLIER: usize = 4;
+const LINUX_STRATEGY_MIN_ROOT_ENTRIES: usize = 32;
+const LINUX_STRATEGY_MIN_FILES: usize = 50_000;
+const LINUX_DOMINANT_FILE_TARGET_CLASS: &str = "linux_amd_asic_reg_giant_header";
+const LINUX_DOMINANT_FILE_MIN_BYTES: u64 = 8 * 1024 * 1024;
+const LINUX_DOMINANT_FILE_MAX_SHARD_THREADS: usize = 3;
+const LINUX_DOMINANT_FILE_TARGET_RANGES_PER_THREAD: usize = 2;
+const LINUX_DOMINANT_FILE_COMPONENTS: [&str; 8] = [
+    "benchsuite",
+    "linux",
+    "drivers",
+    "gpu",
+    "drm",
+    "amd",
+    "include",
+    "asic_reg",
+];
 
 #[derive(Debug, Clone)]
 pub struct SearchConfig {
@@ -43,6 +66,24 @@ pub struct SearchConfig {
     pub max_hits: Option<usize>,
     pub threads: Option<usize>,
     pub collect_hits: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedSearchOptions {
+    pub include_hidden: bool,
+    pub follow_symlinks: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedSearchTargets {
+    roots: Arc<[PathBuf]>,
+    files: Arc<[PathBuf]>,
+    path_depths: Arc<[u16]>,
+    path_index_by_path: Arc<OnceLock<HashMap<PathBuf, usize>>>,
+    options: PreparedSearchOptions,
+    telemetry: DiscoveryTelemetry,
+    directory_root_count: usize,
+    root_entry_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,15 +103,20 @@ pub struct SearchReport {
 
 #[derive(Debug)]
 struct FileScanOutcome {
-    path: PathBuf,
+    path: Option<PathBuf>,
+    path_index: Option<usize>,
     duration_ms: f64,
     bytes: u64,
     hits: Vec<SearchHit>,
     match_count: usize,
     acceleration_bailouts: usize,
     regex_decomposition: RegexDecompositionStats,
+    unicode_casefold_prefilter: UnicodeCaseFoldPrefilterStats,
+    fast_count_density: FastCountDensityStats,
     scanned: bool,
     shard_plan: Option<ParallelShardPlan>,
+    linux_dominant_target: bool,
+    linux_dominant_file: LinuxDominantFileExecution,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -85,6 +131,8 @@ struct DiscoveryTelemetry {
 #[derive(Debug)]
 struct DiscoveryResult {
     files: Vec<PathBuf>,
+    directory_root_count: usize,
+    root_entry_count: usize,
     telemetry: DiscoveryTelemetry,
 }
 
@@ -100,6 +148,7 @@ struct StreamingScanResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutionMode {
     Materialized,
+    MaterializedPrepared,
     StreamingStatsOnly,
 }
 
@@ -107,6 +156,7 @@ impl ExecutionMode {
     fn as_str(self) -> &'static str {
         match self {
             Self::Materialized => "materialized",
+            Self::MaterializedPrepared => "materialized_prepared",
             Self::StreamingStatsOnly => "streaming_stats_only",
         }
     }
@@ -129,6 +179,53 @@ struct ParallelShardPlan {
 #[derive(Debug, Clone, Copy)]
 struct ConcurrencyPlanner {
     available_threads: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LinuxStrategyInputs {
+    matcher_strategy_supported: bool,
+    effective_roots: usize,
+    directory_roots: usize,
+    root_entry_count: usize,
+    files_discovered: usize,
+    collect_hits: bool,
+    outer_parallel_shard_safe: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LinuxDominantFileExecution {
+    eligible: bool,
+    activated: bool,
+    bailed_out: bool,
+    shard_threads: usize,
+    range_count: usize,
+    chunk_bytes: usize,
+}
+
+fn linux_strategy_prefers_streaming(inputs: LinuxStrategyInputs) -> bool {
+    inputs.matcher_strategy_supported
+        && !inputs.collect_hits
+        && inputs.effective_roots == 1
+        && inputs.directory_roots == 1
+        && inputs.root_entry_count >= LINUX_STRATEGY_MIN_ROOT_ENTRIES
+}
+
+fn linux_strategy_selector_eligible(inputs: LinuxStrategyInputs) -> bool {
+    linux_strategy_prefers_streaming(inputs) && inputs.files_discovered >= LINUX_STRATEGY_MIN_FILES
+}
+
+fn linux_strategy_stats(inputs: LinuxStrategyInputs, current_strategy: &str) -> LinuxStrategyStats {
+    let mut telemetry = LinuxStrategyStats::default();
+    telemetry.selector_eligible = linux_strategy_selector_eligible(inputs);
+    telemetry.current_strategy.push_str(current_strategy);
+    telemetry.matcher_strategy_supported = inputs.matcher_strategy_supported;
+    telemetry.effective_roots = inputs.effective_roots;
+    telemetry.directory_roots = inputs.directory_roots;
+    telemetry.root_entry_count = inputs.root_entry_count;
+    telemetry.files_discovered = inputs.files_discovered;
+    telemetry.collect_hits = inputs.collect_hits;
+    telemetry.outer_parallel_shard_safe = inputs.outer_parallel_shard_safe;
+    telemetry
 }
 
 impl ConcurrencyPlanner {
@@ -155,6 +252,16 @@ impl ConcurrencyPlanner {
         }
     }
 
+    fn plan_materialized_prepared(
+        self,
+        requested_threads: Option<usize>,
+        file_count: usize,
+    ) -> RunConcurrencyPlan {
+        let mut plan = self.plan_materialized(requested_threads, file_count);
+        plan.execution_mode = ExecutionMode::MaterializedPrepared;
+        plan
+    }
+
     fn plan_streaming(self, requested_threads: Option<usize>) -> RunConcurrencyPlan {
         let outer_scan_threads = requested_threads
             .map(|threads| threads.max(1))
@@ -170,11 +277,13 @@ impl ConcurrencyPlanner {
         self,
         file_len: usize,
         outer_scan_threads: usize,
+        dominant_literal_scan: bool,
     ) -> Option<ParallelShardPlan> {
         parallel_fast_count_plan_with_available(
             file_len,
             outer_scan_threads,
             self.available_threads,
+            dominant_literal_scan,
         )
     }
 }
@@ -185,6 +294,82 @@ struct DiscoveryDispatch {
     seen: Option<Arc<Mutex<BTreeSet<PathBuf>>>>,
     files_discovered: Arc<AtomicUsize>,
     duplicate_paths: Arc<AtomicUsize>,
+}
+
+impl PreparedSearchTargets {
+    pub fn discover(roots: Vec<PathBuf>, options: PreparedSearchOptions) -> Result<Self> {
+        let partitioned = partition_root_paths(&roots);
+        let discovery = discover_files_with_options(options, partitioned)?;
+        Ok(Self::from_discovery(roots, options, discovery))
+    }
+
+    pub fn from_config(config: &SearchConfig) -> Result<Self> {
+        Self::discover(config.roots.clone(), search_options(config))
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    pub fn files(&self) -> &[PathBuf] {
+        self.files.as_ref()
+    }
+
+    pub fn roots(&self) -> &[PathBuf] {
+        self.roots.as_ref()
+    }
+
+    pub fn max_path_depth(&self) -> usize {
+        self.path_depths.iter().copied().max().unwrap_or(0) as usize
+    }
+
+    pub fn lazy_path_index_enabled(&self) -> bool {
+        self.path_index_by_path.get().is_none()
+    }
+
+    pub fn path_index_for(&self, path: &Path) -> Option<usize> {
+        let index = self.path_index_by_path.get_or_init(|| {
+            self.files
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(idx, file)| (file, idx))
+                .collect()
+        });
+        index.get(path).copied()
+    }
+
+    fn ensure_compatible(&self, config: &SearchConfig) -> Result<()> {
+        if self.roots.as_ref() != config.roots.as_slice() {
+            bail!("prepared search targets were built for a different root set");
+        }
+        if self.options != search_options(config) {
+            bail!("prepared search targets were built with different discovery options");
+        }
+        Ok(())
+    }
+
+    fn from_discovery(
+        roots: Vec<PathBuf>,
+        options: PreparedSearchOptions,
+        discovery: DiscoveryResult,
+    ) -> Self {
+        let path_depths = discovery
+            .files
+            .iter()
+            .map(|path| path_component_depth(path))
+            .collect::<Vec<_>>();
+        Self {
+            roots: Arc::from(roots),
+            files: Arc::from(discovery.files),
+            path_depths: Arc::from(path_depths),
+            path_index_by_path: Arc::new(OnceLock::new()),
+            options,
+            telemetry: discovery.telemetry,
+            directory_root_count: discovery.directory_root_count,
+            root_entry_count: discovery.root_entry_count,
+        }
+    }
 }
 
 impl SearchConfig {
@@ -208,8 +393,23 @@ impl SearchConfig {
     }
 }
 
+pub fn prepare_search_targets(
+    roots: Vec<PathBuf>,
+    options: PreparedSearchOptions,
+) -> Result<PreparedSearchTargets> {
+    PreparedSearchTargets::discover(roots, options)
+}
+
 pub fn run_search(config: &SearchConfig) -> Result<SearchReport> {
     run_search_inner(config)
+}
+
+pub fn run_search_prepared(
+    config: &SearchConfig,
+    prepared_targets: &PreparedSearchTargets,
+) -> Result<SearchReport> {
+    let concurrency = ConcurrencyPlanner::detect();
+    run_search_materialized_prepared(config, prepared_targets, concurrency)
 }
 
 fn run_search_inner(config: &SearchConfig) -> Result<SearchReport> {
@@ -242,6 +442,10 @@ fn run_search_materialized(
     stats.overlap_pruned_roots = discovery.telemetry.overlap_pruned_roots;
     stats.discovered_duplicate_paths = discovery.telemetry.discovered_duplicate_paths;
     stats.files_discovered = discovery.files.len();
+    stats.set_linux_dominant_file_context(
+        LINUX_DOMINANT_FILE_TARGET_CLASS,
+        LINUX_DOMINANT_FILE_MIN_BYTES,
+    );
 
     let run_plan = concurrency.plan_materialized(config.threads, discovery.files.len());
     stats.set_concurrency_context(
@@ -249,21 +453,43 @@ fn run_search_materialized(
         run_plan.outer_scan_threads,
         run_plan.execution_mode.as_str(),
     );
+    stats.observe_linux_strategy(linux_strategy_stats(
+        LinuxStrategyInputs {
+            matcher_strategy_supported: config.plan.supports_large_directory_streaming_selector(),
+            effective_roots: stats.effective_roots,
+            directory_roots: discovery.directory_root_count,
+            root_entry_count: discovery.root_entry_count,
+            files_discovered: discovery.files.len(),
+            collect_hits: config.collect_hits,
+            outer_parallel_shard_safe: config.plan.supports_outer_parallel_shard_fast_count(),
+        },
+        run_plan.execution_mode.as_str(),
+    ));
     let scan_started = Instant::now();
     let mut outcomes = scan_paths(
         &discovery.files,
         &config.plan,
         config.collect_hits,
+        config.max_hits,
         concurrency,
         run_plan.outer_scan_threads,
     )?;
     stats.timings.scan_ms = scan_started.elapsed().as_secs_f64() * 1_000.0;
 
-    for outcome in outcomes.drain(..) {
-        merge_outcome(&mut stats, &mut hits, config.collect_hits, outcome);
-    }
-
     let aggregate_started = Instant::now();
+    let merge_started = Instant::now();
+    for outcome in outcomes.drain(..) {
+        merge_outcome(
+            &mut stats,
+            &mut hits,
+            config.collect_hits,
+            config.max_hits,
+            Some(&discovery.files),
+            outcome,
+        );
+    }
+    stats.timings.aggregate_merge_ms = merge_started.elapsed().as_secs_f64() * 1_000.0;
+    let finalize_started = Instant::now();
     if config.collect_hits {
         hits.sort_by(|a, b| {
             a.path
@@ -275,6 +501,95 @@ fn run_search_materialized(
             hits.truncate(max_hits);
         }
     }
+    stats.timings.aggregate_finalize_ms = finalize_started.elapsed().as_secs_f64() * 1_000.0;
+    stats.timings.aggregate_ms = aggregate_started.elapsed().as_secs_f64() * 1_000.0;
+    stats.timings.total_ms = total_started.elapsed().as_secs_f64() * 1_000.0;
+
+    Ok(SearchReport {
+        expression: config.plan.source.clone(),
+        hits,
+        stats,
+    })
+}
+
+fn run_search_materialized_prepared(
+    config: &SearchConfig,
+    prepared_targets: &PreparedSearchTargets,
+    concurrency: ConcurrencyPlanner,
+) -> Result<SearchReport> {
+    prepared_targets.ensure_compatible(config)?;
+
+    let total_started = Instant::now();
+    let mut stats = SearchStats::default();
+    let mut hits = Vec::new();
+    stats.timings.discover_ms = 0.0;
+    stats.input_roots = prepared_targets.telemetry.input_roots;
+    stats.effective_roots = prepared_targets.telemetry.effective_roots;
+    stats.pruned_roots = prepared_targets.telemetry.pruned_roots;
+    stats.overlap_pruned_roots = prepared_targets.telemetry.overlap_pruned_roots;
+    stats.discovered_duplicate_paths = prepared_targets.telemetry.discovered_duplicate_paths;
+    stats.files_discovered = prepared_targets.file_count();
+    stats.set_linux_dominant_file_context(
+        LINUX_DOMINANT_FILE_TARGET_CLASS,
+        LINUX_DOMINANT_FILE_MIN_BYTES,
+    );
+
+    let run_plan =
+        concurrency.plan_materialized_prepared(config.threads, prepared_targets.file_count());
+    stats.set_concurrency_context(
+        run_plan.available_threads,
+        run_plan.outer_scan_threads,
+        run_plan.execution_mode.as_str(),
+    );
+    stats.observe_linux_strategy(linux_strategy_stats(
+        LinuxStrategyInputs {
+            matcher_strategy_supported: config.plan.supports_large_directory_streaming_selector(),
+            effective_roots: stats.effective_roots,
+            directory_roots: prepared_targets.directory_root_count,
+            root_entry_count: prepared_targets.root_entry_count,
+            files_discovered: prepared_targets.file_count(),
+            collect_hits: config.collect_hits,
+            outer_parallel_shard_safe: config.plan.supports_outer_parallel_shard_fast_count(),
+        },
+        run_plan.execution_mode.as_str(),
+    ));
+    let scan_started = Instant::now();
+    let mut outcomes = scan_paths(
+        prepared_targets.files(),
+        &config.plan,
+        config.collect_hits,
+        config.max_hits,
+        concurrency,
+        run_plan.outer_scan_threads,
+    )?;
+    stats.timings.scan_ms = scan_started.elapsed().as_secs_f64() * 1_000.0;
+
+    let aggregate_started = Instant::now();
+    let merge_started = Instant::now();
+    for outcome in outcomes.drain(..) {
+        merge_outcome(
+            &mut stats,
+            &mut hits,
+            config.collect_hits,
+            config.max_hits,
+            Some(prepared_targets.files()),
+            outcome,
+        );
+    }
+    stats.timings.aggregate_merge_ms = merge_started.elapsed().as_secs_f64() * 1_000.0;
+    let finalize_started = Instant::now();
+    if config.collect_hits {
+        hits.sort_by(|a, b| {
+            a.path
+                .cmp(&b.path)
+                .then(a.line.cmp(&b.line))
+                .then(a.column.cmp(&b.column))
+        });
+        if let Some(max_hits) = config.max_hits {
+            hits.truncate(max_hits);
+        }
+    }
+    stats.timings.aggregate_finalize_ms = finalize_started.elapsed().as_secs_f64() * 1_000.0;
     stats.timings.aggregate_ms = aggregate_started.elapsed().as_secs_f64() * 1_000.0;
     stats.timings.total_ms = total_started.elapsed().as_secs_f64() * 1_000.0;
 
@@ -288,11 +603,18 @@ fn run_search_materialized(
 #[cfg_attr(not(test), allow(dead_code))]
 fn discover_files(config: &SearchConfig) -> Result<DiscoveryResult> {
     let roots = partition_roots(config);
-    discover_files_from_targets(config, roots)
+    discover_files_with_options(search_options(config), roots)
 }
 
 fn discover_files_from_targets(
     config: &SearchConfig,
+    roots: RootTargets,
+) -> Result<DiscoveryResult> {
+    discover_files_with_options(search_options(config), roots)
+}
+
+fn discover_files_with_options(
+    options: PreparedSearchOptions,
     roots: RootTargets,
 ) -> Result<DiscoveryResult> {
     if roots.directory_roots.is_empty() {
@@ -300,6 +622,8 @@ fn discover_files_from_targets(
             finalize_discovered_files(roots.direct_files, roots.telemetry.effective_roots > 1);
         return Ok(DiscoveryResult {
             files: files.files,
+            directory_root_count: roots.directory_roots.len(),
+            root_entry_count: roots.root_entry_count,
             telemetry: DiscoveryTelemetry {
                 discovered_duplicate_paths: files.duplicate_paths,
                 ..roots.telemetry
@@ -309,10 +633,12 @@ fn discover_files_from_targets(
 
     let needs_dedupe = roots.telemetry.effective_roots > 1;
     let mut files = roots.direct_files;
-    files.extend(discover_files_parallel(config, &roots.directory_roots)?);
+    files.extend(discover_files_parallel(options, &roots.directory_roots)?);
     let files = finalize_discovered_files(files, needs_dedupe);
     Ok(DiscoveryResult {
         files: files.files,
+        directory_root_count: roots.directory_roots.len(),
+        root_entry_count: roots.root_entry_count,
         telemetry: DiscoveryTelemetry {
             discovered_duplicate_paths: files.duplicate_paths,
             ..roots.telemetry
@@ -330,14 +656,14 @@ fn should_stream_stats_only(config: &SearchConfig, roots: &RootTargets) -> bool 
         && (roots.telemetry.input_roots > 1 || prefer_single_root_streaming_stats_only())
 }
 
-fn build_walk_builder(config: &SearchConfig, roots: &[PathBuf]) -> WalkBuilder {
+fn build_walk_builder(options: PreparedSearchOptions, roots: &[PathBuf]) -> WalkBuilder {
     let mut builder = WalkBuilder::new(&roots[0]);
     for root in roots.iter().skip(1) {
         builder.add(root);
     }
     builder
-        .hidden(!config.include_hidden)
-        .follow_links(config.follow_symlinks)
+        .hidden(!options.include_hidden)
+        .follow_links(options.follow_symlinks)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
@@ -346,8 +672,11 @@ fn build_walk_builder(config: &SearchConfig, roots: &[PathBuf]) -> WalkBuilder {
     builder
 }
 
-fn discover_files_parallel(config: &SearchConfig, roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    let builder = build_walk_builder(config, roots);
+fn discover_files_parallel(
+    options: PreparedSearchOptions,
+    roots: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    let builder = build_walk_builder(options, roots);
     let (sender, receiver) = channel::unbounded::<PathBuf>();
     let walker = builder.build_parallel();
     walker.run(|| {
@@ -371,11 +700,16 @@ fn discover_files_parallel(config: &SearchConfig, roots: &[PathBuf]) -> Result<V
 struct RootTargets {
     direct_files: Vec<PathBuf>,
     directory_roots: Vec<PathBuf>,
+    root_entry_count: usize,
     telemetry: DiscoveryTelemetry,
 }
 
 fn partition_roots(config: &SearchConfig) -> RootTargets {
-    let normalized = normalize_roots(&config.roots);
+    partition_root_paths(&config.roots)
+}
+
+fn partition_root_paths(roots: &[PathBuf]) -> RootTargets {
+    let normalized = normalize_roots(roots);
     let mut direct_files = Vec::new();
     let mut directory_roots = Vec::new();
 
@@ -386,17 +720,41 @@ fn partition_roots(config: &SearchConfig) -> RootTargets {
         }
     }
 
+    let root_entry_count = if normalized.roots.len() == 1 && directory_roots.len() == 1 {
+        count_root_entries(&directory_roots[0])
+    } else {
+        0
+    };
+
     RootTargets {
         direct_files,
         directory_roots,
+        root_entry_count,
         telemetry: DiscoveryTelemetry {
-            input_roots: config.roots.len(),
+            input_roots: roots.len(),
             effective_roots: normalized.roots.len(),
-            pruned_roots: config.roots.len().saturating_sub(normalized.roots.len()),
+            pruned_roots: roots.len().saturating_sub(normalized.roots.len()),
             overlap_pruned_roots: normalized.overlap_pruned_roots,
             discovered_duplicate_paths: 0,
         },
     }
+}
+
+fn search_options(config: &SearchConfig) -> PreparedSearchOptions {
+    PreparedSearchOptions {
+        include_hidden: config.include_hidden,
+        follow_symlinks: config.follow_symlinks,
+    }
+}
+
+fn path_component_depth(path: &Path) -> u16 {
+    path.components().count().min(u16::MAX as usize) as u16
+}
+
+fn count_root_entries(root: &Path) -> usize {
+    std::fs::read_dir(root)
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone)]
@@ -531,6 +889,56 @@ fn comparable_root_path(root: &NormalizedRoot) -> &Path {
     root.canonical.as_deref().unwrap_or(root.path.as_path())
 }
 
+fn is_linux_dominant_file_target(path: &Path, bytes: u64) -> bool {
+    if bytes < LINUX_DOMINANT_FILE_MIN_BYTES {
+        return false;
+    }
+
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| !extension.eq_ignore_ascii_case("h"))
+        .unwrap_or(true)
+    {
+        return false;
+    }
+
+    path_contains_component_sequence(path, &LINUX_DOMINANT_FILE_COMPONENTS)
+}
+
+fn path_contains_component_sequence(path: &Path, sequence: &[&str]) -> bool {
+    if sequence.is_empty() {
+        return true;
+    }
+
+    let components: Vec<String> = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .collect();
+
+    components.windows(sequence.len()).any(|window| {
+        window
+            .iter()
+            .zip(sequence.iter())
+            .all(|(actual, expected)| actual == expected)
+    })
+}
+
+fn linux_dominant_file_gate(
+    path: &Path,
+    plan: &ExpressionPlan,
+    collect_hits: bool,
+    outer_scan_threads: usize,
+    bytes: u64,
+) -> bool {
+    !collect_hits
+        && outer_scan_threads <= 1
+        && plan.supports_byte_mode()
+        && is_linux_dominant_file_target(path, bytes)
+        && (!plan.supports_parallel_fast_count_ranges()
+            || !plan.supports_outer_parallel_shard_fast_count())
+}
+
 fn available_threads() -> usize {
     std::thread::available_parallelism()
         .map(usize::from)
@@ -603,17 +1011,37 @@ fn run_search_streaming_stats_only(
     stats.files_discovered = streaming.files_discovered;
     stats.timings.discover_ms = streaming.discover_ms;
     stats.timings.scan_ms = streaming.scan_ms;
+    stats.set_linux_dominant_file_context(
+        LINUX_DOMINANT_FILE_TARGET_CLASS,
+        LINUX_DOMINANT_FILE_MIN_BYTES,
+    );
     stats.set_concurrency_context(
         run_plan.available_threads,
         run_plan.outer_scan_threads,
         run_plan.execution_mode.as_str(),
     );
+    stats.observe_linux_strategy(linux_strategy_stats(
+        LinuxStrategyInputs {
+            matcher_strategy_supported: config.plan.supports_large_directory_streaming_selector(),
+            effective_roots: roots.telemetry.effective_roots,
+            directory_roots: roots.directory_roots.len(),
+            root_entry_count: roots.root_entry_count,
+            files_discovered: streaming.files_discovered,
+            collect_hits: config.collect_hits,
+            outer_parallel_shard_safe: config.plan.supports_outer_parallel_shard_fast_count(),
+        },
+        run_plan.execution_mode.as_str(),
+    ));
 
     let aggregate_started = Instant::now();
+    let merge_started = Instant::now();
     let mut ignored_hits = Vec::new();
     for outcome in streaming.outcomes {
-        merge_outcome(&mut stats, &mut ignored_hits, false, outcome);
+        merge_outcome(&mut stats, &mut ignored_hits, false, None, None, outcome);
     }
+    stats.timings.aggregate_merge_ms = merge_started.elapsed().as_secs_f64() * 1_000.0;
+    let finalize_started = Instant::now();
+    stats.timings.aggregate_finalize_ms = finalize_started.elapsed().as_secs_f64() * 1_000.0;
     stats.timings.aggregate_ms = aggregate_started.elapsed().as_secs_f64() * 1_000.0;
     stats.timings.total_ms = total_started.elapsed().as_secs_f64() * 1_000.0;
 
@@ -694,7 +1122,7 @@ fn discover_files_streaming(
     roots: &[PathBuf],
     dispatch: &DiscoveryDispatch,
 ) {
-    let builder = build_walk_builder(config, roots);
+    let builder = build_walk_builder(search_options(config), roots);
     let walker = builder.build_parallel();
     walker.run(|| {
         let dispatch = dispatch.clone();
@@ -726,8 +1154,11 @@ fn worker_scan_loop(
         if sender
             .send(scan_file(
                 &path,
+                None,
+                true,
                 plan.as_ref(),
                 false,
+                None,
                 concurrency,
                 resolved_threads,
             ))
@@ -775,13 +1206,26 @@ fn scan_paths(
     files: &[PathBuf],
     plan: &ExpressionPlan,
     collect_hits: bool,
+    hit_limit: Option<usize>,
     concurrency: ConcurrencyPlanner,
     resolved_threads: usize,
 ) -> Result<Vec<FileScanOutcome>> {
     if resolved_threads <= 1 {
         return Ok(files
             .iter()
-            .map(|path| scan_file(path, plan, collect_hits, concurrency, resolved_threads))
+            .enumerate()
+            .map(|(path_index, path)| {
+                scan_file(
+                    path,
+                    Some(path_index),
+                    false,
+                    plan,
+                    collect_hits,
+                    hit_limit,
+                    concurrency,
+                    resolved_threads,
+                )
+            })
             .collect());
     }
 
@@ -792,7 +1236,19 @@ fn scan_paths(
     Ok(pool.install(|| {
         files
             .par_iter()
-            .map(|path| scan_file(path, plan, collect_hits, concurrency, resolved_threads))
+            .enumerate()
+            .map(|(path_index, path)| {
+                scan_file(
+                    path,
+                    Some(path_index),
+                    false,
+                    plan,
+                    collect_hits,
+                    hit_limit,
+                    concurrency,
+                    resolved_threads,
+                )
+            })
             .collect()
     }))
 }
@@ -801,14 +1257,34 @@ fn merge_outcome(
     stats: &mut SearchStats,
     hits: &mut Vec<SearchHit>,
     collect_hits: bool,
+    hit_limit: Option<usize>,
+    materialized_paths: Option<&[PathBuf]>,
     outcome: FileScanOutcome,
 ) {
     if outcome.scanned {
+        let outcome_path = outcome_path(&outcome, materialized_paths);
         stats.files_scanned += 1;
         stats.bytes_scanned += outcome.bytes;
+        stats.observe_scan_work(outcome.duration_ms);
         stats.acceleration_bailouts += outcome.acceleration_bailouts;
         stats.observe_regex_decomposition(outcome.regex_decomposition);
-        stats.consider_slow_file(&outcome.path, outcome.duration_ms, outcome.bytes);
+        stats.observe_unicode_casefold_prefilter(outcome.unicode_casefold_prefilter);
+        stats.observe_fast_count_density(outcome.fast_count_density);
+        stats.observe_linux_dominant_file_sample(outcome.linux_dominant_target, outcome.bytes);
+        stats.observe_linux_dominant_file_execution(
+            outcome.linux_dominant_file.eligible,
+            outcome.linux_dominant_file.activated,
+            outcome.linux_dominant_file.bailed_out,
+            outcome.linux_dominant_file.shard_threads,
+            outcome.linux_dominant_file.range_count,
+            outcome.linux_dominant_file.chunk_bytes,
+        );
+        stats.consider_slow_file(
+            outcome_path,
+            outcome.duration_ms,
+            outcome.bytes,
+            outcome.linux_dominant_target,
+        );
         stats.matches_found += outcome.match_count;
         if let Some(shard_plan) = outcome.shard_plan {
             stats.observe_parallel_sharding(
@@ -816,19 +1292,66 @@ fn merge_outcome(
                 shard_plan.range_count,
                 shard_plan.chunk_bytes,
             );
+            stats.observe_fast_count_density(FastCountDensityStats {
+                shard_merge_calls: 1,
+                shard_merge_ranges: shard_plan.range_count,
+                shard_merge_matches: outcome.match_count,
+                ..FastCountDensityStats::default()
+            });
         }
         if collect_hits {
-            hits.extend(outcome.hits);
+            merge_hits(hits, outcome.hits, hit_limit);
         }
     } else {
         stats.files_skipped += 1;
     }
 }
 
+fn outcome_path<'a>(
+    outcome: &'a FileScanOutcome,
+    materialized_paths: Option<&'a [PathBuf]>,
+) -> &'a Path {
+    if let Some(path_index) = outcome.path_index {
+        return materialized_paths
+            .and_then(|paths| paths.get(path_index))
+            .map(PathBuf::as_path)
+            .expect("materialized FileScanOutcome path index must resolve");
+    }
+
+    outcome
+        .path
+        .as_deref()
+        .expect("streaming FileScanOutcome must carry owned path")
+}
+
+fn merge_hits(hits: &mut Vec<SearchHit>, incoming: Vec<SearchHit>, hit_limit: Option<usize>) {
+    match hit_limit {
+        Some(0) => {}
+        Some(limit) => {
+            hits.extend(incoming);
+            if hits.len() > limit {
+                let _ = hits.select_nth_unstable_by(limit, compare_hits);
+                hits.truncate(limit);
+            }
+        }
+        None => hits.extend(incoming),
+    }
+}
+
+fn compare_hits(left: &SearchHit, right: &SearchHit) -> CmpOrdering {
+    left.path
+        .cmp(&right.path)
+        .then(left.line.cmp(&right.line))
+        .then(left.column.cmp(&right.column))
+}
+
 fn scan_file(
     path: &Path,
+    path_index: Option<usize>,
+    own_path: bool,
     plan: &ExpressionPlan,
     collect_hits: bool,
+    hit_limit: Option<usize>,
     concurrency: ConcurrencyPlanner,
     outer_scan_threads: usize,
 ) -> FileScanOutcome {
@@ -836,20 +1359,23 @@ fn scan_file(
     let mut outcome = {
         let mut file = match File::open(path) {
             Ok(file) => file,
-            Err(_) => return failed_outcome(path, 0),
+            Err(_) => return failed_outcome(path, path_index, own_path, 0),
         };
 
         let mut tiny = [0u8; TINY_FILE_INLINE_LIMIT];
         let tiny_read = match file.read(&mut tiny) {
             Ok(read) => read,
-            Err(_) => return failed_outcome(path, 0),
+            Err(_) => return failed_outcome(path, path_index, own_path, 0),
         };
 
         if tiny_read < TINY_FILE_INLINE_LIMIT {
             scan_loaded_bytes(
                 path,
+                path_index,
+                own_path,
                 plan,
                 collect_hits,
+                hit_limit,
                 concurrency,
                 outer_scan_threads,
                 &tiny[..tiny_read],
@@ -859,14 +1385,17 @@ fn scan_file(
             let mut sentinel = [0u8; 1];
             let sentinel_read = match file.read(&mut sentinel) {
                 Ok(read) => read,
-                Err(_) => return failed_outcome(path, tiny_read as u64),
+                Err(_) => return failed_outcome(path, path_index, own_path, tiny_read as u64),
             };
 
             if sentinel_read == 0 {
                 scan_loaded_bytes(
                     path,
+                    path_index,
+                    own_path,
                     plan,
                     collect_hits,
+                    hit_limit,
                     concurrency,
                     outer_scan_threads,
                     &tiny,
@@ -875,7 +1404,14 @@ fn scan_file(
             } else {
                 let metadata = match file.metadata() {
                     Ok(metadata) => metadata,
-                    Err(_) => return failed_outcome(path, (tiny_read + sentinel_read) as u64),
+                    Err(_) => {
+                        return failed_outcome(
+                            path,
+                            path_index,
+                            own_path,
+                            (tiny_read + sentinel_read) as u64,
+                        )
+                    }
                 };
 
                 if metadata.len() <= SMALL_FILE_INLINE_LIMIT {
@@ -883,12 +1419,15 @@ fn scan_file(
                     bytes.extend_from_slice(&tiny);
                     bytes.push(sentinel[0]);
                     if file.read_to_end(&mut bytes).is_err() {
-                        return failed_outcome(path, metadata.len());
+                        return failed_outcome(path, path_index, own_path, metadata.len());
                     }
                     scan_loaded_bytes(
                         path,
+                        path_index,
+                        own_path,
                         plan,
                         collect_hits,
+                        hit_limit,
                         concurrency,
                         outer_scan_threads,
                         &bytes,
@@ -897,12 +1436,17 @@ fn scan_file(
                 } else {
                     let mmap = match unsafe { MmapOptions::new().map(&file) } {
                         Ok(mmap) => mmap,
-                        Err(_) => return failed_outcome(path, metadata.len()),
+                        Err(_) => {
+                            return failed_outcome(path, path_index, own_path, metadata.len())
+                        }
                     };
                     scan_loaded_bytes(
                         path,
+                        path_index,
+                        own_path,
                         plan,
                         collect_hits,
+                        hit_limit,
                         concurrency,
                         outer_scan_threads,
                         &mmap,
@@ -918,68 +1462,151 @@ fn scan_file(
 
 fn scan_loaded_bytes(
     path: &Path,
+    path_index: Option<usize>,
+    own_path: bool,
     plan: &ExpressionPlan,
     collect_hits: bool,
+    hit_limit: Option<usize>,
     concurrency: ConcurrencyPlanner,
     outer_scan_threads: usize,
     bytes: &[u8],
     file_bytes: u64,
 ) -> FileScanOutcome {
     if is_likely_binary(bytes) {
-        return failed_outcome(path, file_bytes);
+        return failed_outcome(path, path_index, own_path, file_bytes);
     }
 
     let mut hits = Vec::new();
     let mut match_count = 0usize;
     let mut acceleration_bailouts = 0usize;
     let mut regex_decomposition = RegexDecompositionStats::default();
+    let mut unicode_casefold_prefilter = UnicodeCaseFoldPrefilterStats::default();
+    let mut fast_count_density = FastCountDensityStats::default();
+    let mut linux_dominant_file = LinuxDominantFileExecution {
+        eligible: linux_dominant_file_gate(
+            path,
+            plan,
+            collect_hits,
+            outer_scan_threads,
+            file_bytes,
+        ),
+        ..LinuxDominantFileExecution::default()
+    };
     let mut cached_path = None::<String>;
 
     if !collect_hits {
-        if let Some((count, shard_plan)) =
-            maybe_parallel_fast_count_bytes(plan, bytes, concurrency, outer_scan_threads)
-        {
-            match_count = count;
-            return completed_outcome(
-                path,
-                file_bytes,
-                hits,
-                match_count,
-                acceleration_bailouts,
-                regex_decomposition,
-                Some(shard_plan),
-            );
-        }
-        match plan.fast_decomposition_count_no_hits_bytes(bytes) {
-            Some(FastDecompositionResult::Count(counts)) => {
-                match_count = counts.match_count;
-                regex_decomposition = counts.telemetry(true, false);
+        if linux_dominant_file.eligible {
+            if let Some((fast_count, shard_plan)) = maybe_linux_dominant_file_fast_count_bytes(
+                plan,
+                bytes,
+                concurrency,
+                outer_scan_threads,
+            ) {
+                match_count = fast_count.count;
+                unicode_casefold_prefilter = fast_count.unicode_casefold_prefilter;
+                fast_count_density = fast_count.fast_count_density;
+                linux_dominant_file.activated = true;
+                linux_dominant_file.shard_threads = shard_plan.shard_threads;
+                linux_dominant_file.range_count = shard_plan.range_count;
+                linux_dominant_file.chunk_bytes = shard_plan.chunk_bytes;
                 return completed_outcome(
                     path,
+                    path_index,
+                    own_path,
                     file_bytes,
                     hits,
                     match_count,
                     acceleration_bailouts,
                     regex_decomposition,
-                    None,
+                    unicode_casefold_prefilter,
+                    fast_count_density,
+                    Some(shard_plan),
+                    linux_dominant_file,
                 );
             }
-            Some(FastDecompositionResult::Bailout(counts)) => {
+            linux_dominant_file.bailed_out = true;
+        }
+        let skip_parallel_fast_count = outer_scan_threads > 1
+            && plan.uses_single_literal_counter()
+            && is_linux_dominant_file_target(path, file_bytes);
+        if !skip_parallel_fast_count {
+            if let Some((fast_count, shard_plan)) =
+                maybe_parallel_fast_count_bytes(plan, bytes, concurrency, outer_scan_threads)
+            {
+                match_count = fast_count.count;
+                unicode_casefold_prefilter = fast_count.unicode_casefold_prefilter;
+                fast_count_density = fast_count.fast_count_density;
+                return completed_outcome(
+                    path,
+                    path_index,
+                    own_path,
+                    file_bytes,
+                    hits,
+                    match_count,
+                    acceleration_bailouts,
+                    regex_decomposition,
+                    unicode_casefold_prefilter,
+                    fast_count_density,
+                    Some(shard_plan),
+                    linux_dominant_file,
+                );
+            }
+        }
+        let decomposition_result = if let Some((result, shard_plan)) =
+            maybe_parallel_regex_decomposition_count_bytes(
+                plan,
+                bytes,
+                concurrency,
+                outer_scan_threads,
+            ) {
+            Some((result, Some(shard_plan)))
+        } else {
+            plan.fast_decomposition_count_no_hits_bytes(bytes)
+                .map(|result| (result, None))
+        };
+
+        match decomposition_result {
+            Some((FastDecompositionResult::Count(counts), shard_plan)) => {
+                match_count = counts.match_count;
+                regex_decomposition = counts.telemetry(true, false);
+                return completed_outcome(
+                    path,
+                    path_index,
+                    own_path,
+                    file_bytes,
+                    hits,
+                    match_count,
+                    acceleration_bailouts,
+                    regex_decomposition,
+                    unicode_casefold_prefilter,
+                    fast_count_density,
+                    shard_plan,
+                    linux_dominant_file,
+                );
+            }
+            Some((FastDecompositionResult::Bailout(counts), _)) => {
                 acceleration_bailouts += 1;
                 regex_decomposition = counts.telemetry(false, true);
             }
             None => {}
         }
-        if let Some(count) = plan.fast_match_count_no_hits_bytes(bytes) {
-            match_count = count;
+        if let Some(fast_count) = plan.fast_match_count_no_hits_bytes_with_stats(bytes) {
+            match_count = fast_count.count;
+            unicode_casefold_prefilter = fast_count.unicode_casefold_prefilter;
+            fast_count_density = fast_count.fast_count_density;
             return completed_outcome(
                 path,
+                path_index,
+                own_path,
                 file_bytes,
                 hits,
                 match_count,
                 acceleration_bailouts,
                 regex_decomposition,
+                unicode_casefold_prefilter,
+                fast_count_density,
                 None,
+                linux_dominant_file,
             );
         }
     }
@@ -1000,11 +1627,10 @@ fn scan_loaded_bytes(
 
             let raw_line = &bytes[line_start..line_end];
             let line = trim_trailing_cr(raw_line);
-
             line_no += 1;
             if plan.matches_bytes(line) {
                 match_count += 1;
-                if collect_hits {
+                if should_retain_hit(collect_hits, hits.len(), hit_limit) {
                     hits.push(SearchHit {
                         path: cached_path
                             .get_or_insert_with(|| path.display().to_string())
@@ -1028,12 +1654,17 @@ fn scan_loaded_bytes(
                 match_count = count;
                 return completed_outcome(
                     path,
+                    path_index,
+                    own_path,
                     file_bytes,
                     hits,
                     match_count,
                     acceleration_bailouts,
                     regex_decomposition,
+                    unicode_casefold_prefilter,
+                    fast_count_density,
                     None,
+                    linux_dominant_file,
                 );
             }
         }
@@ -1043,7 +1674,7 @@ fn scan_loaded_bytes(
                 continue;
             }
             match_count += 1;
-            if collect_hits {
+            if should_retain_hit(collect_hits, hits.len(), hit_limit) {
                 hits.push(SearchHit {
                     path: cached_path
                         .get_or_insert_with(|| path.display().to_string())
@@ -1058,13 +1689,26 @@ fn scan_loaded_bytes(
 
     completed_outcome(
         path,
+        path_index,
+        own_path,
         file_bytes,
         hits,
         match_count,
         acceleration_bailouts,
         regex_decomposition,
+        unicode_casefold_prefilter,
+        fast_count_density,
         None,
+        linux_dominant_file,
     )
+}
+
+fn should_retain_hit(collect_hits: bool, retained_hits: usize, hit_limit: Option<usize>) -> bool {
+    collect_hits
+        && match hit_limit {
+            Some(limit) => retained_hits < limit,
+            None => true,
+        }
 }
 
 fn is_likely_binary(bytes: &[u8]) -> bool {
@@ -1077,11 +1721,15 @@ fn maybe_parallel_fast_count_bytes(
     bytes: &[u8],
     concurrency: ConcurrencyPlanner,
     outer_scan_threads: usize,
-) -> Option<(usize, ParallelShardPlan)> {
+) -> Option<(FastCountOutcome, ParallelShardPlan)> {
     if outer_scan_threads > 1 && !plan.supports_outer_parallel_shard_fast_count() {
         return None;
     }
-    let shard_plan = concurrency.plan_parallel_fast_count(bytes.len(), outer_scan_threads)?;
+    let shard_plan = concurrency.plan_parallel_fast_count(
+        bytes.len(),
+        outer_scan_threads,
+        plan.uses_single_literal_counter(),
+    )?;
     let ranges = build_chunk_ranges(bytes.len(), shard_plan.chunk_bytes);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(shard_plan.shard_threads)
@@ -1090,9 +1738,237 @@ fn maybe_parallel_fast_count_bytes(
     pool.install(|| {
         ranges
             .par_iter()
-            .map(|(start, end)| plan.fast_match_count_no_hits_bytes_in_range(bytes, *start, *end))
+            .map(|(start, end)| {
+                plan.fast_match_count_no_hits_bytes_in_range_with_stats(bytes, *start, *end)
+            })
             .collect::<Option<Vec<_>>>()
-            .map(|counts| (counts.into_iter().sum(), shard_plan))
+            .map(|counts| {
+                let mut merged = FastCountOutcome::default();
+                for count in counts {
+                    merged.count += count.count;
+                    merged.fast_count_density.literal_range_calls +=
+                        count.fast_count_density.literal_range_calls;
+                    merged.fast_count_density.literal_range_bytes +=
+                        count.fast_count_density.literal_range_bytes;
+                    merged.fast_count_density.literal_matches +=
+                        count.fast_count_density.literal_matches;
+                    merged.fast_count_density.alternate_range_calls +=
+                        count.fast_count_density.alternate_range_calls;
+                    merged.fast_count_density.alternate_range_bytes +=
+                        count.fast_count_density.alternate_range_bytes;
+                    merged.fast_count_density.alternate_matches +=
+                        count.fast_count_density.alternate_matches;
+                    merged.unicode_casefold_prefilter = {
+                        let mut telemetry = merged.unicode_casefold_prefilter;
+                        telemetry.full_scan_calls +=
+                            count.unicode_casefold_prefilter.full_scan_calls;
+                        telemetry.range_scan_calls +=
+                            count.unicode_casefold_prefilter.range_scan_calls;
+                        telemetry.candidate_prefix_hits +=
+                            count.unicode_casefold_prefilter.candidate_prefix_hits;
+                        telemetry.candidate_windows_verified +=
+                            count.unicode_casefold_prefilter.candidate_windows_verified;
+                        telemetry.confirmed_matches +=
+                            count.unicode_casefold_prefilter.confirmed_matches;
+                        telemetry.rejected_candidates +=
+                            count.unicode_casefold_prefilter.rejected_candidates;
+                        telemetry.candidate_gap_bytes_total +=
+                            count.unicode_casefold_prefilter.candidate_gap_bytes_total;
+                        telemetry.candidate_gap_samples +=
+                            count.unicode_casefold_prefilter.candidate_gap_samples;
+                        telemetry.max_prefix_variant_count = telemetry
+                            .max_prefix_variant_count
+                            .max(count.unicode_casefold_prefilter.max_prefix_variant_count);
+                        telemetry.max_prefix_len = telemetry
+                            .max_prefix_len
+                            .max(count.unicode_casefold_prefilter.max_prefix_len);
+                        telemetry.max_match_len = telemetry
+                            .max_match_len
+                            .max(count.unicode_casefold_prefilter.max_match_len);
+                        telemetry
+                    };
+                }
+                (merged, shard_plan)
+            })
+    })
+}
+
+fn maybe_parallel_regex_decomposition_count_bytes(
+    plan: &ExpressionPlan,
+    bytes: &[u8],
+    concurrency: ConcurrencyPlanner,
+    outer_scan_threads: usize,
+) -> Option<(FastDecompositionResult, ParallelShardPlan)> {
+    let shard_plan = regex_decomposition_parallel_plan_with_available(
+        bytes.len(),
+        outer_scan_threads,
+        concurrency.available_threads,
+    )?;
+    let ranges = build_chunk_ranges(bytes.len(), shard_plan.chunk_bytes);
+    plan.fast_decomposition_count_no_hits_bytes_sharded(bytes, &ranges)
+        .map(|result| (result, shard_plan))
+}
+
+fn regex_decomposition_parallel_plan_with_available(
+    file_len: usize,
+    outer_scan_threads: usize,
+    available: usize,
+) -> Option<ParallelShardPlan> {
+    if file_len < REGEX_DECOMPOSITION_PARALLEL_FILE_THRESHOLD || outer_scan_threads > 1 {
+        return None;
+    }
+
+    let shard_budget = threads_90pct(available.max(1));
+    let shard_threads = shard_budget.min(REGEX_DECOMPOSITION_PARALLEL_MAX_SHARD_THREADS);
+    if shard_threads <= 1 {
+        return None;
+    }
+
+    let range_count = shard_threads;
+    let chunk_bytes = file_len.div_ceil(range_count);
+    Some(ParallelShardPlan {
+        shard_threads,
+        chunk_bytes,
+        range_count,
+    })
+}
+
+fn linux_dominant_file_fast_count_with_available(
+    plan: &ExpressionPlan,
+    bytes: &[u8],
+    outer_scan_threads: usize,
+    available: usize,
+) -> Option<(FastCountOutcome, ParallelShardPlan)> {
+    if !plan.supports_parallel_fast_count_ranges() {
+        return None;
+    }
+
+    let shard_plan = linux_dominant_file_parallel_plan_with_available(
+        bytes.len(),
+        outer_scan_threads,
+        available,
+    )?;
+    let ranges = build_chunk_ranges(bytes.len(), shard_plan.chunk_bytes);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(shard_plan.shard_threads)
+        .build()
+        .ok()?;
+    pool.install(|| {
+        ranges
+            .par_iter()
+            .map(|(start, end)| {
+                plan.fast_match_count_no_hits_bytes_in_range_with_stats(bytes, *start, *end)
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|counts| {
+                let mut merged = FastCountOutcome::default();
+                for count in counts {
+                    merged.count += count.count;
+                    merged.fast_count_density.literal_range_calls +=
+                        count.fast_count_density.literal_range_calls;
+                    merged.fast_count_density.literal_range_bytes +=
+                        count.fast_count_density.literal_range_bytes;
+                    merged.fast_count_density.literal_matches +=
+                        count.fast_count_density.literal_matches;
+                    merged.fast_count_density.alternate_range_calls +=
+                        count.fast_count_density.alternate_range_calls;
+                    merged.fast_count_density.alternate_range_bytes +=
+                        count.fast_count_density.alternate_range_bytes;
+                    merged.fast_count_density.alternate_matches +=
+                        count.fast_count_density.alternate_matches;
+                    merged.unicode_casefold_prefilter = {
+                        let mut telemetry = merged.unicode_casefold_prefilter;
+                        telemetry.full_scan_calls +=
+                            count.unicode_casefold_prefilter.full_scan_calls;
+                        telemetry.range_scan_calls +=
+                            count.unicode_casefold_prefilter.range_scan_calls;
+                        telemetry.candidate_prefix_hits +=
+                            count.unicode_casefold_prefilter.candidate_prefix_hits;
+                        telemetry.candidate_windows_verified +=
+                            count.unicode_casefold_prefilter.candidate_windows_verified;
+                        telemetry.confirmed_matches +=
+                            count.unicode_casefold_prefilter.confirmed_matches;
+                        telemetry.rejected_candidates +=
+                            count.unicode_casefold_prefilter.rejected_candidates;
+                        telemetry.candidate_gap_bytes_total +=
+                            count.unicode_casefold_prefilter.candidate_gap_bytes_total;
+                        telemetry.candidate_gap_samples +=
+                            count.unicode_casefold_prefilter.candidate_gap_samples;
+                        telemetry.max_prefix_variant_count = telemetry
+                            .max_prefix_variant_count
+                            .max(count.unicode_casefold_prefilter.max_prefix_variant_count);
+                        telemetry.max_prefix_len = telemetry
+                            .max_prefix_len
+                            .max(count.unicode_casefold_prefilter.max_prefix_len);
+                        telemetry.max_match_len = telemetry
+                            .max_match_len
+                            .max(count.unicode_casefold_prefilter.max_match_len);
+                        telemetry
+                    };
+                }
+                (merged, shard_plan)
+            })
+    })
+}
+
+fn maybe_linux_dominant_file_fast_count_bytes(
+    plan: &ExpressionPlan,
+    bytes: &[u8],
+    concurrency: ConcurrencyPlanner,
+    outer_scan_threads: usize,
+) -> Option<(FastCountOutcome, ParallelShardPlan)> {
+    linux_dominant_file_fast_count_with_available(
+        plan,
+        bytes,
+        outer_scan_threads,
+        concurrency.available_threads,
+    )
+}
+
+fn linux_dominant_file_parallel_plan_with_available(
+    file_len: usize,
+    outer_scan_threads: usize,
+    available: usize,
+) -> Option<ParallelShardPlan> {
+    if file_len < PARALLEL_FAST_COUNT_FILE_THRESHOLD {
+        return None;
+    }
+
+    let available = available.max(1);
+    if available <= 1 {
+        return None;
+    }
+
+    if outer_scan_threads > 1 {
+        return None;
+    }
+
+    let shard_headroom = threads_90pct(available);
+    let shard_threads = shard_headroom.min(LINUX_DOMINANT_FILE_MAX_SHARD_THREADS);
+    if shard_threads <= 1 {
+        return None;
+    }
+
+    let min_chunk_bytes = parallel_fast_count_min_chunk_bytes(file_len);
+    let max_range_count = file_len.div_ceil(min_chunk_bytes);
+    if max_range_count <= 1 {
+        return None;
+    }
+
+    let target_range_count = shard_threads
+        .saturating_mul(LINUX_DOMINANT_FILE_TARGET_RANGES_PER_THREAD)
+        .clamp(2, max_range_count);
+    let chunk_bytes = file_len.div_ceil(target_range_count).max(min_chunk_bytes);
+    let range_count = build_chunk_ranges(file_len, chunk_bytes).len();
+    let shard_threads = shard_threads.min(range_count);
+    if shard_threads <= 1 || range_count <= 1 {
+        return None;
+    }
+
+    Some(ParallelShardPlan {
+        shard_threads,
+        chunk_bytes,
+        range_count,
     })
 }
 
@@ -1108,14 +1984,21 @@ fn parallel_fast_count_min_chunk_bytes(file_len: usize) -> usize {
 fn parallel_fast_count_plan(
     file_len: usize,
     outer_scan_threads: usize,
+    dominant_literal_scan: bool,
 ) -> Option<ParallelShardPlan> {
-    parallel_fast_count_plan_with_available(file_len, outer_scan_threads, available_threads())
+    parallel_fast_count_plan_with_available(
+        file_len,
+        outer_scan_threads,
+        available_threads(),
+        dominant_literal_scan,
+    )
 }
 
 fn parallel_fast_count_plan_with_available(
     file_len: usize,
     outer_scan_threads: usize,
     available: usize,
+    dominant_literal_scan: bool,
 ) -> Option<ParallelShardPlan> {
     if file_len < PARALLEL_FAST_COUNT_FILE_THRESHOLD {
         return None;
@@ -1126,8 +2009,12 @@ fn parallel_fast_count_plan_with_available(
         return None;
     }
 
-    let shard_budget =
-        parallel_fast_count_thread_budget_with_available(file_len, outer_scan_threads, available)?;
+    let shard_budget = parallel_fast_count_thread_budget_with_available(
+        file_len,
+        outer_scan_threads,
+        available,
+        dominant_literal_scan,
+    )?;
     let min_chunk_bytes = parallel_fast_count_min_chunk_bytes(file_len);
     let max_range_count = file_len.div_ceil(min_chunk_bytes);
     if max_range_count <= 1 {
@@ -1160,10 +2047,16 @@ fn parallel_fast_count_thread_budget_with_available(
     file_len: usize,
     outer_scan_threads: usize,
     available: usize,
+    dominant_literal_scan: bool,
 ) -> Option<usize> {
     let shard_budget = threads_90pct(available.max(1));
 
     if outer_scan_threads <= 1 {
+        if dominant_literal_scan && file_len >= DOMINANT_FILE_PARALLEL_THRESHOLD {
+            let dominant_threads = shard_budget.min(dominant_parallel_thread_cap(shard_budget));
+            return (dominant_threads > 1).then_some(dominant_threads);
+        }
+
         return (shard_budget > 1).then_some(shard_budget);
     }
 
@@ -1172,7 +2065,12 @@ fn parallel_fast_count_thread_budget_with_available(
     }
 
     if file_len < DOMINANT_FILE_PARALLEL_THRESHOLD {
-        let medium_threads = shard_budget.min(3);
+        let medium_thread_cap = if dominant_literal_scan {
+            PARALLEL_FAST_COUNT_OUTER_LITERAL_MEDIUM_THREAD_CAP
+        } else {
+            3
+        };
+        let medium_threads = shard_budget.min(medium_thread_cap);
         return (medium_threads > 1).then_some(medium_threads);
     }
 
@@ -1203,37 +2101,57 @@ fn trim_trailing_cr(raw_line: &[u8]) -> &[u8] {
 
 fn completed_outcome(
     path: &Path,
+    path_index: Option<usize>,
+    own_path: bool,
     bytes: u64,
     hits: Vec<SearchHit>,
     match_count: usize,
     acceleration_bailouts: usize,
     regex_decomposition: RegexDecompositionStats,
+    unicode_casefold_prefilter: UnicodeCaseFoldPrefilterStats,
+    fast_count_density: FastCountDensityStats,
     shard_plan: Option<ParallelShardPlan>,
+    linux_dominant_file: LinuxDominantFileExecution,
 ) -> FileScanOutcome {
     FileScanOutcome {
-        path: path.to_path_buf(),
+        path: own_path.then(|| path.to_path_buf()),
+        path_index,
         duration_ms: 0.0,
         bytes,
         hits,
         match_count,
         acceleration_bailouts,
         regex_decomposition,
+        unicode_casefold_prefilter,
+        fast_count_density,
         scanned: true,
         shard_plan,
+        linux_dominant_target: is_linux_dominant_file_target(path, bytes),
+        linux_dominant_file,
     }
 }
 
-fn failed_outcome(path: &Path, bytes: u64) -> FileScanOutcome {
+fn failed_outcome(
+    path: &Path,
+    path_index: Option<usize>,
+    own_path: bool,
+    bytes: u64,
+) -> FileScanOutcome {
     FileScanOutcome {
-        path: path.to_path_buf(),
+        path: own_path.then(|| path.to_path_buf()),
+        path_index,
         duration_ms: 0.0,
         bytes,
         hits: Vec::new(),
         match_count: 0,
         acceleration_bailouts: 0,
         regex_decomposition: RegexDecompositionStats::default(),
+        unicode_casefold_prefilter: UnicodeCaseFoldPrefilterStats::default(),
+        fast_count_density: FastCountDensityStats::default(),
         scanned: false,
         shard_plan: None,
+        linux_dominant_target: false,
+        linux_dominant_file: LinuxDominantFileExecution::default(),
     }
 }
 
@@ -1241,20 +2159,29 @@ fn failed_outcome(path: &Path, bytes: u64) -> FileScanOutcome {
 mod tests {
     use std::{
         fs,
+        path::Path,
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    use serde_json::Value;
 
     use crate::ExpressionPlan;
 
     use super::{
         auto_threads_for_shape, auto_threads_for_shape_with_available,
         auto_threads_for_streaming_with_available, discover_files, dominant_parallel_thread_cap,
+        is_linux_dominant_file_target, linux_dominant_file_gate,
+        linux_dominant_file_parallel_plan_with_available, linux_strategy_prefers_streaming,
+        linux_strategy_selector_eligible, linux_strategy_stats,
         parallel_fast_count_min_chunk_bytes, parallel_fast_count_plan_with_available,
-        partition_roots, prefer_single_root_streaming_stats_only, run_search,
-        should_stream_stats_only, threads_90pct, SearchConfig,
-        DOMINANT_FILE_PARALLEL_THREAD_CAP_MAX, DOMINANT_FILE_PARALLEL_THRESHOLD,
+        partition_roots, prefer_single_root_streaming_stats_only, prepare_search_targets,
+        run_search, run_search_prepared, scan_loaded_bytes, should_stream_stats_only,
+        threads_90pct, ConcurrencyPlanner, LinuxStrategyInputs, PreparedSearchOptions,
+        SearchConfig, DOMINANT_FILE_PARALLEL_THREAD_CAP_MAX, DOMINANT_FILE_PARALLEL_THRESHOLD,
+        LINUX_DOMINANT_FILE_MIN_BYTES, LINUX_STRATEGY_MIN_FILES, LINUX_STRATEGY_MIN_ROOT_ENTRIES,
         PARALLEL_FAST_COUNT_FILE_THRESHOLD, PARALLEL_FAST_COUNT_MEDIUM_MIN_CHUNK_BYTES,
+        PARALLEL_FAST_COUNT_OUTER_LITERAL_MEDIUM_THREAD_CAP,
     };
 
     fn unique_temp_path(prefix: &str) -> PathBuf {
@@ -1291,7 +2218,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_threads_for_shape_switches_to_90pct_for_large_file_sets() {
+    fn auto_threads_for_shape_uses_90pct_available_threads_for_large_file_sets() {
         let available = 32;
         assert_eq!(auto_threads_for_shape_with_available(24, available), 1);
         assert_eq!(auto_threads_for_shape_with_available(128, available), 4);
@@ -1331,7 +2258,12 @@ mod tests {
     #[test]
     fn parallel_fast_count_plan_stays_off_for_small_files() {
         assert_eq!(
-            parallel_fast_count_plan_with_available(PARALLEL_FAST_COUNT_FILE_THRESHOLD - 1, 1, 32),
+            parallel_fast_count_plan_with_available(
+                PARALLEL_FAST_COUNT_FILE_THRESHOLD - 1,
+                1,
+                32,
+                false,
+            ),
             None
         );
     }
@@ -1339,7 +2271,7 @@ mod tests {
     #[test]
     fn parallel_fast_count_plan_enables_single_threaded_large_files() {
         let file_len = PARALLEL_FAST_COUNT_FILE_THRESHOLD * 4;
-        let shard_plan = parallel_fast_count_plan_with_available(file_len, 1, 32)
+        let shard_plan = parallel_fast_count_plan_with_available(file_len, 1, 32, false)
             .expect("large single-threaded files should parallelize");
         assert!(shard_plan.shard_threads > 1);
         assert!(shard_plan.range_count >= shard_plan.shard_threads);
@@ -1348,9 +2280,13 @@ mod tests {
 
     #[test]
     fn parallel_fast_count_plan_enables_giant_file_override_under_outer_parallelism() {
-        let shard_plan =
-            parallel_fast_count_plan_with_available(DOMINANT_FILE_PARALLEL_THRESHOLD, 16, 32)
-                .expect("dominant giant files should get an inner parallel override");
+        let shard_plan = parallel_fast_count_plan_with_available(
+            DOMINANT_FILE_PARALLEL_THRESHOLD,
+            16,
+            32,
+            false,
+        )
+        .expect("dominant giant files should get an inner parallel override");
         assert!(shard_plan.shard_threads > 1);
         assert!(shard_plan.shard_threads <= DOMINANT_FILE_PARALLEL_THREAD_CAP_MAX);
         assert!(shard_plan.range_count >= shard_plan.shard_threads);
@@ -1359,16 +2295,32 @@ mod tests {
     #[test]
     fn parallel_fast_count_plan_enables_outer_parallel_large_files_with_capped_budget() {
         let file_len = PARALLEL_FAST_COUNT_FILE_THRESHOLD * 4;
-        let shard_plan = parallel_fast_count_plan_with_available(file_len, 8, 32)
+        let shard_plan = parallel_fast_count_plan_with_available(file_len, 8, 32, false)
             .expect("outer-parallel large files should receive a capped inner shard budget");
         assert_eq!(shard_plan.shard_threads, 3);
         assert!(shard_plan.range_count >= shard_plan.shard_threads);
     }
 
     #[test]
+    fn parallel_fast_count_plan_caps_outer_parallel_literal_medium_files_more_aggressively() {
+        let file_len = PARALLEL_FAST_COUNT_FILE_THRESHOLD * 4;
+        let literal_plan = parallel_fast_count_plan_with_available(file_len, 8, 32, true)
+            .expect("outer-parallel literal medium files should still shard");
+        let non_literal_plan = parallel_fast_count_plan_with_available(file_len, 8, 32, false)
+            .expect("outer-parallel non-literal medium files should keep baseline cap");
+
+        assert_eq!(
+            literal_plan.shard_threads,
+            PARALLEL_FAST_COUNT_OUTER_LITERAL_MEDIUM_THREAD_CAP
+        );
+        assert_eq!(non_literal_plan.shard_threads, 3);
+        assert!(literal_plan.range_count >= literal_plan.shard_threads);
+    }
+
+    #[test]
     fn parallel_fast_count_plan_feeds_threads_with_multiple_ranges_on_mid_size_files() {
         let file_len = 144 * 1024 * 1024;
-        let shard_plan = parallel_fast_count_plan_with_available(file_len, 1, 32)
+        let shard_plan = parallel_fast_count_plan_with_available(file_len, 1, 32, false)
             .expect("mid-size shard-safe files should parallelize");
         assert!(shard_plan.shard_threads > 1);
         assert!(shard_plan.range_count >= shard_plan.shard_threads);
@@ -1381,10 +2333,25 @@ mod tests {
     #[test]
     fn parallel_fast_count_plan_enables_two_range_files_at_threshold_plus_epsilon() {
         let file_len = PARALLEL_FAST_COUNT_FILE_THRESHOLD + 4 * 1024;
-        let shard_plan = parallel_fast_count_plan_with_available(file_len, 8, 32)
+        let shard_plan = parallel_fast_count_plan_with_available(file_len, 8, 32, false)
             .expect("two-range files should parallelize when shard budget allows");
         assert!(shard_plan.shard_threads >= 2);
         assert!(shard_plan.range_count >= 2);
+    }
+
+    #[test]
+    fn parallel_fast_count_plan_caps_single_threaded_dominant_literal_only() {
+        let file_len = DOMINANT_FILE_PARALLEL_THRESHOLD;
+        let literal_plan = parallel_fast_count_plan_with_available(file_len, 1, 32, true)
+            .expect("dominant literal files should parallelize with a capped inner budget");
+        let non_literal_plan = parallel_fast_count_plan_with_available(file_len, 1, 32, false)
+            .expect("dominant non-literal files should preserve the wider legacy budget");
+
+        assert_eq!(
+            literal_plan.shard_threads,
+            dominant_parallel_thread_cap(threads_90pct(32))
+        );
+        assert!(non_literal_plan.shard_threads > literal_plan.shard_threads);
     }
 
     #[test]
@@ -1580,6 +2547,56 @@ mod tests {
     }
 
     #[test]
+    fn run_search_max_hits_bounds_retained_hits_without_changing_match_count() {
+        let file = unique_temp_path("iex-engine-max-hits-retention").with_extension("txt");
+        fs::write(
+            &file,
+            "alpha needle\nbeta needle\ngamma needle\ndelta needle\n",
+        )
+        .expect("max-hit fixture should write");
+
+        let plan = ExpressionPlan::parse("lit:needle").expect("plan should parse");
+        let mut config = SearchConfig::new(file.clone(), plan);
+        config.max_hits = Some(2);
+        let report = run_search(&config).expect("max-hit search should succeed");
+
+        assert_eq!(report.stats.matches_found, 4);
+        assert_eq!(report.hits.len(), 2);
+        assert_eq!(report.hits[0].line, 1);
+        assert_eq!(report.hits[0].column, 7);
+        assert_eq!(report.hits[1].line, 2);
+        assert_eq!(report.hits[1].column, 6);
+
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn run_search_max_hits_keeps_global_first_hits_across_files() {
+        let root = unique_temp_path("iex-engine-global-max-hits");
+        fs::create_dir_all(&root).expect("root dir should be created");
+        let first = root.join("a.txt");
+        let second = root.join("b.txt");
+        fs::write(&first, "needle one\nneedle two\nneedle three\n")
+            .expect("first fixture should write");
+        fs::write(&second, "needle four\nneedle five\nneedle six\n")
+            .expect("second fixture should write");
+
+        let plan = ExpressionPlan::parse("lit:needle").expect("plan should parse");
+        let mut config = SearchConfig::from_roots(vec![second.clone(), first.clone()], plan);
+        config.max_hits = Some(2);
+        let report = run_search(&config).expect("max-hit multi-file search should succeed");
+
+        assert_eq!(report.stats.matches_found, 6);
+        assert_eq!(report.hits.len(), 2);
+        assert_eq!(report.hits[0].path, first.display().to_string());
+        assert_eq!(report.hits[0].line, 1);
+        assert_eq!(report.hits[1].path, first.display().to_string());
+        assert_eq!(report.hits[1].line, 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn run_search_stats_only_streams_single_directory_root_without_changing_totals() {
         let root = unique_temp_path("iex-engine-search-stats-only");
         fs::create_dir_all(&root).expect("root dir should be created");
@@ -1636,6 +2653,355 @@ mod tests {
     }
 
     #[test]
+    fn linux_strategy_surface_stats_only_single_root_serializes_discover_and_path() {
+        let root = unique_temp_path("iex-engine-linux-strategy-surface-single");
+        fs::create_dir_all(&root).expect("root dir should be created");
+        fs::write(root.join("one.txt"), "needle here\n").expect("first fixture should write");
+        fs::write(root.join("two.txt"), "needle again\n").expect("second fixture should write");
+
+        let plan = ExpressionPlan::parse("lit:needle").expect("plan should parse");
+        let mut config = SearchConfig::new(root.clone(), plan);
+        config.collect_hits = false;
+        let report = run_search(&config).expect("stats-only search should succeed");
+        let json = serde_json::to_value(&report).expect("report should serialize");
+        let discover_ms = json["stats"]["timings"]["discover_ms"]
+            .as_f64()
+            .expect("discover surface should exist");
+        let aggregate_merge_ms = json["stats"]["timings"]["aggregate_merge_ms"]
+            .as_f64()
+            .expect("aggregate merge surface should exist");
+        let aggregate_finalize_ms = json["stats"]["timings"]["aggregate_finalize_ms"]
+            .as_f64()
+            .expect("aggregate finalize surface should exist");
+        let aggregate_ms = json["stats"]["timings"]["aggregate_ms"]
+            .as_f64()
+            .expect("aggregate surface should exist");
+        let scan_work_ms_total = json["stats"]["timings"]["scan_work_ms_total"]
+            .as_f64()
+            .expect("scan work surface should exist");
+        let literal_range_calls = json["stats"]["fast_count_density"]["literal_range_calls"]
+            .as_u64()
+            .expect("literal range calls should exist");
+        let literal_range_bytes = json["stats"]["fast_count_density"]["literal_range_bytes"]
+            .as_u64()
+            .expect("literal range bytes should exist");
+        let literal_matches = json["stats"]["fast_count_density"]["literal_matches"]
+            .as_u64()
+            .expect("literal matches should exist");
+        let execution_mode = json["stats"]["concurrency"]["execution_mode"]
+            .as_str()
+            .expect("execution mode should exist");
+
+        assert!(discover_ms > 0.0);
+        assert_eq!(
+            execution_mode,
+            if prefer_single_root_streaming_stats_only() {
+                "streaming_stats_only"
+            } else {
+                "materialized"
+            }
+        );
+        assert!(aggregate_ms >= aggregate_merge_ms);
+        assert!(aggregate_ms >= aggregate_finalize_ms);
+        assert!(scan_work_ms_total > 0.0);
+        assert!(literal_range_calls <= u64::MAX);
+        assert!(literal_range_bytes <= u64::MAX);
+        assert!(literal_matches <= u64::MAX);
+        assert!(matches!(
+            json["stats"]["concurrency"]["sharding_enabled"],
+            Value::Bool(_)
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn linux_strategy_surface_stats_only_multi_root_distinguishes_streaming_path() {
+        let root = unique_temp_path("iex-engine-linux-strategy-surface-multi");
+        let left = root.join("left");
+        let right = root.join("right");
+        fs::create_dir_all(&left).expect("left dir should be created");
+        fs::create_dir_all(&right).expect("right dir should be created");
+        fs::write(left.join("one.txt"), "needle here\n").expect("left fixture should write");
+        fs::write(right.join("two.txt"), "needle again\n").expect("right fixture should write");
+
+        let plan = ExpressionPlan::parse("lit:needle").expect("plan should parse");
+        let mut config = SearchConfig::from_roots(vec![left.clone(), right.clone()], plan);
+        config.collect_hits = false;
+        let report = run_search(&config).expect("stats-only multi-root search should succeed");
+        let json = serde_json::to_value(&report).expect("report should serialize");
+
+        assert!(
+            json["stats"]["timings"]["discover_ms"]
+                .as_f64()
+                .expect("discover surface should exist")
+                > 0.0
+        );
+        assert_eq!(
+            json["stats"]["concurrency"]["execution_mode"]
+                .as_str()
+                .expect("execution mode should exist"),
+            "streaming_stats_only"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn linux_strategy_contract_marks_large_single_root_stats_only_lane_eligible() {
+        let inputs = LinuxStrategyInputs {
+            matcher_strategy_supported: true,
+            effective_roots: 1,
+            directory_roots: 1,
+            root_entry_count: LINUX_STRATEGY_MIN_ROOT_ENTRIES,
+            files_discovered: LINUX_STRATEGY_MIN_FILES,
+            collect_hits: false,
+            outer_parallel_shard_safe: true,
+        };
+
+        assert!(linux_strategy_prefers_streaming(inputs));
+        assert!(linux_strategy_selector_eligible(inputs));
+
+        let telemetry = linux_strategy_stats(inputs, "materialized");
+        assert!(telemetry.selector_eligible);
+        assert_eq!(telemetry.current_strategy, "materialized");
+        assert!(telemetry.matcher_strategy_supported);
+        assert_eq!(telemetry.root_entry_count, LINUX_STRATEGY_MIN_ROOT_ENTRIES);
+        assert_eq!(telemetry.files_discovered, LINUX_STRATEGY_MIN_FILES);
+        assert!(!telemetry.collect_hits);
+        assert!(telemetry.outer_parallel_shard_safe);
+    }
+
+    #[test]
+    fn linux_strategy_contract_rejects_small_or_collecting_runs() {
+        let small_inputs = LinuxStrategyInputs {
+            matcher_strategy_supported: true,
+            effective_roots: 1,
+            directory_roots: 1,
+            root_entry_count: LINUX_STRATEGY_MIN_ROOT_ENTRIES - 1,
+            files_discovered: LINUX_STRATEGY_MIN_FILES - 1,
+            collect_hits: false,
+            outer_parallel_shard_safe: false,
+        };
+        let collecting_inputs = LinuxStrategyInputs {
+            matcher_strategy_supported: true,
+            effective_roots: 1,
+            directory_roots: 1,
+            root_entry_count: LINUX_STRATEGY_MIN_ROOT_ENTRIES,
+            files_discovered: LINUX_STRATEGY_MIN_FILES,
+            collect_hits: true,
+            outer_parallel_shard_safe: false,
+        };
+
+        assert!(!linux_strategy_prefers_streaming(small_inputs));
+        assert!(!linux_strategy_selector_eligible(small_inputs));
+        assert!(!linux_strategy_selector_eligible(collecting_inputs));
+        assert!(!linux_strategy_stats(small_inputs, "materialized").selector_eligible);
+        assert!(!linux_strategy_stats(collecting_inputs, "materialized").selector_eligible);
+    }
+
+    #[test]
+    fn linux_dominant_file_target_matches_large_amd_asic_reg_headers() {
+        let path = Path::new(
+            "E:\\Workspaces\\01_Projects\\01_Github\\iEx\\.refs\\ripgrep\\benchsuite\\linux\\drivers\\gpu\\drm\\amd\\include\\asic_reg\\dcn\\dcn_3_2_0_sh_mask.h",
+        );
+
+        assert!(is_linux_dominant_file_target(
+            path,
+            LINUX_DOMINANT_FILE_MIN_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn linux_dominant_file_target_rejects_small_or_non_amd_headers() {
+        let small_path = Path::new(
+            "E:\\Workspaces\\01_Projects\\01_Github\\iEx\\.refs\\ripgrep\\benchsuite\\linux\\drivers\\gpu\\drm\\amd\\include\\asic_reg\\nbio\\nbio_7_7_0_sh_mask.h",
+        );
+        let non_target_path = Path::new(
+            "E:\\Workspaces\\01_Projects\\01_Github\\iEx\\.refs\\ripgrep\\benchsuite\\linux\\drivers\\gpu\\drm\\i915\\gvt\\sched_policy.h",
+        );
+
+        assert!(!is_linux_dominant_file_target(
+            small_path,
+            LINUX_DOMINANT_FILE_MIN_BYTES - 1
+        ));
+        assert!(!is_linux_dominant_file_target(
+            non_target_path,
+            LINUX_DOMINANT_FILE_MIN_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn linux_giant_file_gate_opens_for_targeted_stats_only_lanes_without_outer_shard_path() {
+        let path = Path::new(
+            "E:\\Workspaces\\01_Projects\\01_Github\\iEx\\.refs\\ripgrep\\benchsuite\\linux\\drivers\\gpu\\drm\\amd\\include\\asic_reg\\nbio\\nbio_7_7_0_sh_mask.h",
+        );
+        let boundary_plan =
+            ExpressionPlan::parse(r"re:\bPM_RESUME\b").expect("boundary plan should parse");
+        let generic_plan =
+            ExpressionPlan::parse(r"re:\w{5}\s+\w{5}").expect("generic plan should parse");
+
+        assert!(linux_dominant_file_gate(
+            path,
+            &boundary_plan,
+            false,
+            1,
+            LINUX_DOMINANT_FILE_MIN_BYTES + 1
+        ));
+        assert!(linux_dominant_file_gate(
+            path,
+            &generic_plan,
+            false,
+            1,
+            LINUX_DOMINANT_FILE_MIN_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn linux_giant_file_gate_rejects_collecting_and_already_shard_safe_literal_lanes() {
+        let path = Path::new(
+            "E:\\Workspaces\\01_Projects\\01_Github\\iEx\\.refs\\ripgrep\\benchsuite\\linux\\drivers\\gpu\\drm\\amd\\include\\asic_reg\\nbio\\nbio_7_7_0_sh_mask.h",
+        );
+        let literal_plan =
+            ExpressionPlan::parse("lit:PM_RESUME").expect("literal plan should parse");
+
+        assert!(!linux_dominant_file_gate(
+            path,
+            &literal_plan,
+            false,
+            1,
+            LINUX_DOMINANT_FILE_MIN_BYTES + 1
+        ));
+        assert!(!linux_dominant_file_gate(
+            path,
+            &literal_plan,
+            true,
+            1,
+            LINUX_DOMINANT_FILE_MIN_BYTES + 1
+        ));
+        assert!(!linux_dominant_file_gate(
+            path,
+            &ExpressionPlan::parse(r"re:\bPM_RESUME\b").expect("boundary plan should parse"),
+            false,
+            8,
+            LINUX_DOMINANT_FILE_MIN_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn linux_giant_file_kernel_activates_sharded_fast_count_for_targeted_boundary_lane() {
+        let path = Path::new(
+            "E:\\Workspaces\\01_Projects\\01_Github\\iEx\\.refs\\ripgrep\\benchsuite\\linux\\drivers\\gpu\\drm\\amd\\include\\asic_reg\\nbio\\nbio_7_7_0_sh_mask.h",
+        );
+        let plan = ExpressionPlan::parse(r"re:\bPM_RESUME\b").expect("plan should parse");
+        let repeat_count = 1_000_000usize;
+        let line = b"prefix PM_RESUME suffix PM_RESUME2 trailer\n";
+        let bytes = line.repeat(repeat_count);
+
+        assert!(bytes.len() > PARALLEL_FAST_COUNT_FILE_THRESHOLD);
+
+        let outcome = scan_loaded_bytes(
+            path,
+            None,
+            false,
+            &plan,
+            false,
+            None,
+            ConcurrencyPlanner {
+                available_threads: 32,
+            },
+            1,
+            &bytes,
+            bytes.len() as u64,
+        );
+
+        assert_eq!(outcome.match_count, repeat_count);
+        assert!(outcome.linux_dominant_file.eligible);
+        assert!(outcome.linux_dominant_file.activated);
+        assert!(!outcome.linux_dominant_file.bailed_out);
+        assert!(outcome.shard_plan.is_some());
+        let shard_plan = outcome.shard_plan.expect("targeted kernel should shard");
+        assert_eq!(
+            outcome.linux_dominant_file.shard_threads,
+            shard_plan.shard_threads
+        );
+        assert_eq!(
+            outcome.linux_dominant_file.range_count,
+            shard_plan.range_count
+        );
+        assert_eq!(
+            outcome.linux_dominant_file.chunk_bytes,
+            shard_plan.chunk_bytes
+        );
+    }
+
+    #[test]
+    fn linux_giant_file_kernel_stays_off_without_range_support() {
+        let path = Path::new(
+            "E:\\Workspaces\\01_Projects\\01_Github\\iEx\\.refs\\ripgrep\\benchsuite\\linux\\drivers\\gpu\\drm\\amd\\include\\asic_reg\\nbio\\nbio_7_7_0_sh_mask.h",
+        );
+        let plan = ExpressionPlan::parse(r"re:\w{5}\s+\w{5}").expect("plan should parse");
+        let repeat_count = 1_000_000usize;
+        let line = b"alpha bravo trailer\n";
+        let bytes = line.repeat(repeat_count);
+        let expected = plan
+            .fast_match_count_no_hits_bytes(&bytes)
+            .expect("generic bytes regex should keep canonical count semantics");
+
+        assert!(bytes.len() > PARALLEL_FAST_COUNT_FILE_THRESHOLD);
+
+        let outcome = scan_loaded_bytes(
+            path,
+            None,
+            false,
+            &plan,
+            false,
+            None,
+            ConcurrencyPlanner {
+                available_threads: 32,
+            },
+            1,
+            &bytes,
+            bytes.len() as u64,
+        );
+
+        assert_eq!(outcome.match_count, expected);
+        assert!(outcome.linux_dominant_file.eligible);
+        assert!(!outcome.linux_dominant_file.activated);
+        assert!(outcome.linux_dominant_file.bailed_out);
+        assert!(outcome.shard_plan.is_none());
+    }
+
+    #[test]
+    fn linux_giant_file_budget_keeps_serial_outer_scan_eligible() {
+        let file_len = PARALLEL_FAST_COUNT_FILE_THRESHOLD + 4 * 1024;
+        let shard_plan = linux_dominant_file_parallel_plan_with_available(file_len, 1, 32)
+            .expect("serial outer scans should preserve the targeted inner plan");
+
+        assert_eq!(shard_plan.shard_threads, 3);
+        assert_eq!(shard_plan.range_count, 3);
+        assert!(shard_plan.chunk_bytes >= PARALLEL_FAST_COUNT_MEDIUM_MIN_CHUNK_BYTES);
+    }
+
+    #[test]
+    fn linux_giant_file_budget_bails_when_outer_scan_is_parallel() {
+        let file_len = PARALLEL_FAST_COUNT_FILE_THRESHOLD + 4 * 1024;
+
+        assert_eq!(
+            linux_dominant_file_parallel_plan_with_available(file_len, 2, 32),
+            None
+        );
+        assert_eq!(
+            linux_dominant_file_parallel_plan_with_available(file_len, 29, 32),
+            None
+        );
+        assert_eq!(
+            linux_dominant_file_parallel_plan_with_available(file_len, 32, 32),
+            None
+        );
+    }
+
+    #[test]
     fn regex_decomposition_stats_only_matches_collecting_totals() {
         let file = unique_temp_path("iex-engine-regex-decomposition").with_extension("txt");
         fs::write(&file, "aa Holmes bb\nxx Holmes yy Holmes zz\nHolmes\n")
@@ -1673,6 +3039,67 @@ mod tests {
         assert_eq!(
             stats_only.stats.regex_decomposition.candidate_lines_matched,
             2
+        );
+
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn stats_only_search_reports_unicode_casefold_prefilter_telemetry() {
+        let file = unique_temp_path("iex-engine-unicode-casefold-prefilter").with_extension("txt");
+        fs::write(
+            &file,
+            "\u{0428}\u{0435}\u{0440}\u{043b}\u{043e}\u{043a} \u{0425}\u{043e}\u{043b}\u{043c}\u{0441}\n\
+\u{0428}\u{0415}\u{0420}\u{041b}\u{041e}\u{041a} \u{0425}\u{041e}\u{041b}\u{041c}\u{0421}\n\
+\u{0428}\u{0435}\u{0440}\u{043b}\u{043e} zzz\n",
+        )
+        .expect("unicode regex fixture should write");
+
+        let plan = ExpressionPlan::parse(
+            "re:(?i)\u{0428}\u{0435}\u{0440}\u{043b}\u{043e}\u{043a} \u{0425}\u{043e}\u{043b}\u{043c}\u{0441}",
+        )
+        .expect("plan should parse");
+        let mut stats_only_config = SearchConfig::new(file.clone(), plan);
+        stats_only_config.collect_hits = false;
+        let stats_only = run_search(&stats_only_config).expect("stats-only search");
+
+        assert!(stats_only.hits.is_empty());
+        assert_eq!(stats_only.stats.matches_found, 2);
+        assert_eq!(
+            stats_only.stats.unicode_casefold_prefilter.full_scan_calls,
+            1
+        );
+        assert_eq!(
+            stats_only.stats.unicode_casefold_prefilter.range_scan_calls,
+            0
+        );
+        assert_eq!(
+            stats_only
+                .stats
+                .unicode_casefold_prefilter
+                .candidate_prefix_hits,
+            3
+        );
+        assert_eq!(
+            stats_only
+                .stats
+                .unicode_casefold_prefilter
+                .confirmed_matches,
+            2
+        );
+        assert_eq!(
+            stats_only
+                .stats
+                .unicode_casefold_prefilter
+                .rejected_candidates,
+            1
+        );
+        assert_eq!(
+            stats_only
+                .stats
+                .unicode_casefold_prefilter
+                .max_prefix_variant_count,
+            32
         );
 
         let _ = fs::remove_file(file);
@@ -1744,6 +3171,7 @@ mod tests {
         config.collect_hits = false;
         let roots = partition_roots(&config);
 
+        assert_eq!(roots.root_entry_count, 1);
         assert_eq!(
             should_stream_stats_only(&config, &roots),
             prefer_single_root_streaming_stats_only()
@@ -1767,6 +3195,85 @@ mod tests {
         assert_eq!(roots.telemetry.input_roots, 2);
         assert_eq!(roots.telemetry.effective_roots, 1);
         assert!(should_stream_stats_only(&config, &roots));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepared_search_targets_skip_discovery_and_preserve_file_set() {
+        let root = unique_temp_path("iex-engine-prepared-targets");
+        fs::create_dir_all(&root).expect("root dir should be created");
+        let alpha = root.join("alpha.txt");
+        let beta_dir = root.join("nested");
+        let beta = beta_dir.join("beta.txt");
+        fs::create_dir_all(&beta_dir).expect("nested dir should be created");
+        fs::write(&alpha, "needle alpha\n").expect("alpha fixture should write");
+        fs::write(&beta, "needle beta\n").expect("beta fixture should write");
+
+        let prepared = prepare_search_targets(
+            vec![root.clone()],
+            PreparedSearchOptions {
+                include_hidden: false,
+                follow_symlinks: false,
+            },
+        )
+        .expect("prepared targets should build");
+
+        assert_eq!(prepared.file_count(), 2);
+        assert!(prepared.max_path_depth() >= 1);
+        assert!(prepared.path_index_for(&alpha).is_some());
+        assert!(prepared.path_index_for(&beta).is_some());
+        assert!(!prepared.lazy_path_index_enabled());
+
+        let plan = ExpressionPlan::parse("lit:needle").expect("plan should parse");
+        let config = SearchConfig::from_roots(vec![root.clone()], plan);
+        let report =
+            run_search_prepared(&config, &prepared).expect("prepared search should succeed");
+
+        assert_eq!(report.stats.timings.discover_ms, 0.0);
+        assert!(report.stats.timings.scan_work_ms_total > 0.0);
+        assert!(report.stats.timings.aggregate_ms >= report.stats.timings.aggregate_merge_ms);
+        assert!(report.stats.timings.aggregate_ms >= report.stats.timings.aggregate_finalize_ms);
+        assert!(report.stats.fast_count_density.literal_range_calls <= usize::MAX);
+        assert!(report.stats.fast_count_density.literal_range_bytes <= usize::MAX);
+        assert!(report.stats.fast_count_density.literal_matches <= usize::MAX);
+        assert_eq!(report.stats.files_discovered, 2);
+        assert_eq!(report.stats.files_scanned, 2);
+        assert_eq!(report.stats.matches_found, 2);
+        assert_eq!(
+            report.stats.concurrency.execution_mode,
+            "materialized_prepared"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepared_search_targets_reject_option_mismatch() {
+        let root = unique_temp_path("iex-engine-prepared-target-mismatch");
+        fs::create_dir_all(&root).expect("root dir should be created");
+        fs::write(root.join("needle.txt"), "needle here\n").expect("fixture file should write");
+
+        let prepared = prepare_search_targets(
+            vec![root.clone()],
+            PreparedSearchOptions {
+                include_hidden: false,
+                follow_symlinks: false,
+            },
+        )
+        .expect("prepared targets should build");
+        let plan = ExpressionPlan::parse("lit:needle").expect("plan should parse");
+        let mut config = SearchConfig::from_roots(vec![root.clone()], plan);
+        config.include_hidden = true;
+
+        let error = run_search_prepared(&config, &prepared)
+            .expect_err("mismatched prepared targets should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("prepared search targets were built"),
+            "expected mismatch error, got {error}"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

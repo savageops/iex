@@ -7,9 +7,9 @@ use regex::escape as regex_escape;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "iex",
+    name = "ix",
     about = "iEx v2 intelligent expression search CLI",
-    after_help = "Compatibility: `iex PATTERN [PATH]...` accepts a narrow rg-style search subset for agent-friendly ingress. Canonical native commands remain `iex search <expr> [PATH]...` and `iex explain <expr>`."
+    after_help = "Compatibility: `ix PATTERN [PATH]...` accepts a narrow rg-style search subset for agent-friendly ingress. Canonical native commands remain `ix search <expr> [PATH]...` and `ix explain <expr>`."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -70,7 +70,7 @@ struct ExplainArgs {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "iex",
+    name = "ix",
     no_binary_name = true,
     disable_help_flag = true,
     disable_help_subcommand = true,
@@ -152,9 +152,9 @@ fn try_parse_compat_args(raw_args: &[OsString]) -> Result<CompatSearchArgs> {
 
 fn format_compat_parse_error(raw_args: &[OsString], kind: ErrorKind) -> String {
     if let Some(flag) = first_unsupported_compat_flag(raw_args) {
-        let supported = "`iex PATTERN [PATH]...`, `-e/--regexp`, `-F/--fixed-strings`, `-i/--ignore-case`, `-j/--threads`, `-n/--line-number`, `--json`, and `--hidden`";
+        let supported = "`ix PATTERN [PATH]...`, `-e/--regexp`, `-F/--fixed-strings`, `-i/--ignore-case`, `-j/--threads`, `-n/--line-number`, `--json`, and `--hidden`";
         return format!(
-            "rg-style compatibility does not support `{flag}`. Supported subset: {supported}. Use `iex search <expr> [PATH]...` for native iEx syntax."
+            "rg-style compatibility does not support `{flag}`. Supported subset: {supported}. Use `ix search <expr> [PATH]...` for native iEx syntax."
         );
     }
 
@@ -163,12 +163,12 @@ fn format_compat_parse_error(raw_args: &[OsString], kind: ErrorKind) -> String {
         ErrorKind::MissingRequiredArgument | ErrorKind::TooFewValues
     ) || compat_patterns_missing(raw_args)
     {
-        return "rg-style compatibility expects `iex PATTERN [PATH]...` or `iex -e <PATTERN> [PATH]...`.".to_owned();
+        return "rg-style compatibility expects `ix PATTERN [PATH]...` or `ix -e <PATTERN> [PATH]...`.".to_owned();
     }
 
-    let supported = "`iex PATTERN [PATH]...`, `-e/--regexp`, `-F/--fixed-strings`, `-i/--ignore-case`, `-j/--threads`, `-n/--line-number`, `--json`, and `--hidden`";
+    let supported = "`ix PATTERN [PATH]...`, `-e/--regexp`, `-F/--fixed-strings`, `-i/--ignore-case`, `-j/--threads`, `-n/--line-number`, `--json`, and `--hidden`";
     format!(
-        "rg-style compatibility could not classify this search request. Supported subset: {supported}. Use `iex search <expr> [PATH]...` for native iEx syntax."
+        "rg-style compatibility could not classify this search request. Supported subset: {supported}. Use `ix search <expr> [PATH]...` for native iEx syntax."
     )
 }
 
@@ -246,7 +246,7 @@ impl CompatSearchArgs {
         let (patterns, path_args): (Vec<String>, Vec<OsString>) = if self.regexps.is_empty() {
             let (pattern, paths) = self.positionals.split_first().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "rg-style compatibility expects `iex PATTERN [PATH]...` or `iex -e <PATTERN> [PATH]...`."
+                    "rg-style compatibility expects `ix PATTERN [PATH]...` or `ix -e <PATTERN> [PATH]...`."
                 )
             })?;
             (vec![os_string_to_string(pattern)?], paths.to_vec())
@@ -294,7 +294,7 @@ fn lower_compat_expression(
     if patterns.len() == 1 && looks_like_iex_expression(&patterns[0]) {
         if fixed_strings || ignore_case {
             bail!(
-                "native iEx expressions cannot be combined with `-F` or `-i` in rg-style compatibility mode. Use `iex search <expr> [PATH]...` instead."
+                "native iEx expressions cannot be combined with `-F` or `-i` in rg-style compatibility mode. Use `ix search <expr> [PATH]...` instead."
             );
         }
         return Ok(patterns[0].trim().to_owned());
@@ -310,7 +310,7 @@ fn lower_compat_expression(
             .any(|pattern| pattern.contains("&&") || pattern.contains("||"))
     {
         bail!(
-            "regex patterns containing `&&` or `||` are ambiguous with native iEx boolean operators. Use `iex search <expr> [PATH]...` for this pattern."
+            "regex patterns containing `&&` or `||` are ambiguous with native iEx boolean operators. Use `ix search <expr> [PATH]...` for this pattern."
         );
     }
 
@@ -506,17 +506,17 @@ mod tests {
 
         assert!(message.contains("`--files`"));
         assert!(message.contains("Supported subset"));
-        assert!(message.contains("iex search <expr> [PATH]..."));
+        assert!(message.contains("ix search <expr> [PATH]..."));
     }
 
     #[test]
     fn compat_detects_known_subcommands_without_hardcoding() {
         assert!(should_preserve_canonical_parse(&[
-            OsString::from("iex"),
+            OsString::from("ix"),
             OsString::from("search"),
         ]));
         assert!(!should_preserve_canonical_parse(&[
-            OsString::from("iex"),
+            OsString::from("ix"),
             OsString::from("timeout"),
         ]));
     }

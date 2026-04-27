@@ -436,6 +436,8 @@
       let summary = null;
       let sources = null;
       let selectedTrendWindow = "12h";
+      const RECENT_RUN_CONTEXT_MIN_SAMPLES = 5;
+      const STABLE_LOSER_MIN_SLOWER_RUN_PCT = 55;
       const trendWindows = {
         "1h": { label: "1h", ms: 60 * 60 * 1000 },
         "12h": { label: "12h", ms: 12 * 60 * 60 * 1000 },
@@ -472,6 +474,136 @@
           return `${ratio.toFixed(3)}x (${delta.toFixed(2)}% slower)`;
         }
         return `${ratio.toFixed(3)}x (parity)`;
+      }
+
+      function quantileSorted(sortedValues, percentile) {
+        if (!sortedValues.length) {
+          return 0;
+        }
+        if (sortedValues.length === 1) {
+          return sortedValues[0];
+        }
+        const clamped = Math.min(1, Math.max(0, percentile));
+        const index = Math.min(
+          sortedValues.length - 1,
+          Math.max(0, Math.floor((sortedValues.length - 1) * clamped)),
+        );
+        return sortedValues[index];
+      }
+
+      function isAuthoritativeComparator(metrics) {
+        return metrics?.authority === "authoritative";
+      }
+
+      function isTimingOnlyComparator(metrics) {
+        return metrics?.authority === "timing_only";
+      }
+
+      function contextShowsStableLoser(context) {
+        if (!context || context.runs < RECENT_RUN_CONTEXT_MIN_SAMPLES) {
+          return false;
+        }
+        return context.median > 1 && context.slowerRunPct >= STABLE_LOSER_MIN_SLOWER_RUN_PCT;
+      }
+
+      function buildProfileCompetitorContext(name) {
+        const grouped = new Map();
+        for (const run of history) {
+          const metrics = competitorRunMetrics(run, name);
+          if (!metrics.available || !run?.profile || !Number.isFinite(metrics.ratio) || metrics.ratio <= 0) {
+            continue;
+          }
+          const bucket = grouped.get(run.profile) || {
+            ratios: [],
+            slowerRuns: 0,
+            authoritativeRatios: [],
+            authoritativeSlowerRuns: 0,
+            authoritativeRuns: 0,
+            timingOnlyRuns: 0,
+            unknownAuthorityRuns: 0,
+          };
+          bucket.ratios.push(metrics.ratio);
+          if (metrics.ratio > 1) {
+            bucket.slowerRuns += 1;
+          }
+          if (isAuthoritativeComparator(metrics)) {
+            bucket.authoritativeRuns += 1;
+            bucket.authoritativeRatios.push(metrics.ratio);
+            if (metrics.ratio > 1) {
+              bucket.authoritativeSlowerRuns += 1;
+            }
+          } else if (isTimingOnlyComparator(metrics)) {
+            bucket.timingOnlyRuns += 1;
+          } else {
+            bucket.unknownAuthorityRuns += 1;
+          }
+          grouped.set(run.profile, bucket);
+        }
+
+        const context = new Map();
+        for (const [profile, bucket] of grouped.entries()) {
+          const preferAuthoritative = name === "iex_previous" && bucket.authoritativeRatios.length > 0;
+          const ratios = preferAuthoritative ? bucket.authoritativeRatios : bucket.ratios;
+          const sorted = ratios.slice().sort((left, right) => left - right);
+          const slowerRuns = preferAuthoritative ? bucket.authoritativeSlowerRuns : bucket.slowerRuns;
+          context.set(profile, {
+            runs: sorted.length,
+            totalRuns: bucket.ratios.length,
+            median: quantileSorted(sorted, 0.5),
+            p95: quantileSorted(sorted, 0.95),
+            slowerRunPct: sorted.length ? (slowerRuns / sorted.length) * 100 : 0,
+            authoritativeRuns: bucket.authoritativeRuns,
+            timingOnlyRuns: bucket.timingOnlyRuns,
+            unknownAuthorityRuns: bucket.unknownAuthorityRuns,
+            stableBaseline: preferAuthoritative ? "authoritative" : "all-available",
+          });
+        }
+        return context;
+      }
+
+      function contextualRatioClass(ratio, context, metrics = null) {
+        const base = ratioClass(ratio);
+        if (base !== "bad") {
+          return base;
+        }
+        if (isTimingOnlyComparator(metrics)) {
+          return "warn";
+        }
+        if (!context || context.runs < RECENT_RUN_CONTEXT_MIN_SAMPLES) {
+          return "bad";
+        }
+        if (contextShowsStableLoser(context)) {
+          return "bad";
+        }
+        const transientCeiling = Math.max(1.02, context.p95);
+        return ratio <= transientCeiling ? "warn" : "bad";
+      }
+
+      function contextualRatioTitle(ratio, context, label, metrics = null) {
+        if (!Number.isFinite(ratio) || ratio <= 0) {
+          return `${label}: unavailable`;
+        }
+        if (isTimingOnlyComparator(metrics)) {
+          const caveat = metrics?.caveat || "match-count parity is missing";
+          return `${label}: timing-only comparison (${caveat})`;
+        }
+        if (!context || context.runs < RECENT_RUN_CONTEXT_MIN_SAMPLES) {
+          return `${label}: single-run ratio ${fmt(ratio, 3)}x with insufficient profile baseline`;
+        }
+        const authoritySuffix = context.stableBaseline === "authoritative"
+          ? ` using authoritative baseline (${context.runs}/${context.totalRuns} runs)`
+          : "";
+        const transientCeiling = Math.max(1.02, context.p95);
+        if (contextShowsStableLoser(context) && ratio > 1) {
+          return `${label}: stable profile loss frontier${authoritySuffix}; median ${fmt(context.median, 3)}x, slower-run share ${fmt(context.slowerRunPct)}%, p95 ${fmt(context.p95, 3)}x over ${context.runs} runs`;
+        }
+        if (ratio > 1 && ratio <= transientCeiling) {
+          return `${label}: transient in-band miss${authoritySuffix}; median ${fmt(context.median, 3)}x, p95 ${fmt(context.p95, 3)}x over ${context.runs} runs`;
+        }
+        if (ratio > 1) {
+          return `${label}: out-of-band spike${authoritySuffix}; median ${fmt(context.median, 3)}x, p95 ${fmt(context.p95, 3)}x over ${context.runs} runs`;
+        }
+        return `${label}: profile median ${fmt(context.median, 3)}x, p95 ${fmt(context.p95, 3)}x over ${context.runs} runs${authoritySuffix}`;
       }
 
       function connectionLabel(connected) {
@@ -615,12 +747,28 @@
         const available = Boolean(competitor?.available && iex > 0 && durationMs > 0);
         const ratio = available ? iex / durationMs : null;
         const speedupPct = available ? ((durationMs - iex) / durationMs) * 100 : null;
+        const authority =
+          typeof competitor?.comparatorAuthority === "string"
+            ? competitor.comparatorAuthority
+            : typeof run?.previousIexAuthority === "string"
+              ? run.previousIexAuthority
+              : null;
+        const matchCountParity =
+          typeof competitor?.matchCountParity === "boolean"
+            ? competitor.matchCountParity
+            : typeof run?.previousIexMatchCountParity === "boolean"
+              ? run.previousIexMatchCountParity
+              : null;
+        const caveat = competitor?.caveat || run?.previousIexCaveat || null;
         return {
           competitor,
           available,
           durationMs,
           ratio,
           speedupPct,
+          authority,
+          matchCountParity,
+          caveat,
         };
       }
 
@@ -683,6 +831,15 @@
         const primaryChallenger = sum?.primaryChallenger || null;
         const previousIex = competitorSummaryEntry("iex_previous");
         const previousIexAvailable = previousIex?.status === "available";
+        const previousIexAuthoritative = previousIex?.ratioBaseline === "authoritative";
+        const previousIexTimingOnly =
+          previousIexAvailable && !previousIexAuthoritative && asNum(previousIex?.timingOnlyRuns, 0) > 0;
+        const previousIexMedian = asNum(previousIex?.iexRatio?.median, 0);
+        const previousIexRatioText = previousIexAuthoritative
+          ? `<span class="${ratioClass(previousIexMedian)}">${ratioLabel(previousIexMedian)}</span>`
+          : previousIexTimingOnly
+            ? `<span class="warn">timing-only (${asNum(previousIex?.timingOnlyRuns, 0)} runs)</span>`
+            : "n/a";
         const medianRatio = asNum(ratio.median, 0);
         const p95Ratio = asNum(ratio.p95, 0);
         const selfPct = asNum(selfImprovement.improvementPct, 0);
@@ -722,9 +879,7 @@
           ],
           [
             "iEx/Previous",
-            previousIexAvailable
-              ? `<span class="${ratioClass(asNum(previousIex?.iexRatio?.median, 0))}">${ratioLabel(asNum(previousIex?.iexRatio?.median, 0))}</span>`
-              : "n/a",
+            previousIexRatioText,
           ],
         ];
         metricGrid.innerHTML = metrics
@@ -740,6 +895,19 @@
         const challenger = sum?.primaryChallenger || null;
         const previousIex = competitorSummaryEntry("iex_previous");
         const previousIexAvailable = previousIex?.status === "available";
+        const previousIexAuthoritative = previousIex?.ratioBaseline === "authoritative";
+        const previousIexTimingOnly =
+          previousIexAvailable && !previousIexAuthoritative && asNum(previousIex?.timingOnlyRuns, 0) > 0;
+        const previousIexOverallRatio = previousIexAuthoritative
+          ? `${fmt(previousIex.iexRatio?.median, 3)}x`
+          : previousIexTimingOnly
+            ? `timing-only (${asNum(previousIex?.timingOnlyRuns, 0)} runs)`
+            : "n/a";
+        const previousIexRecentRatio = previousIexAuthoritative
+          ? `${fmt(previousIex.iexRatio?.p95, 3)}x p95`
+          : previousIexTimingOnly
+            ? "match-count caveat"
+            : "n/a";
         const selfWindowLabel = selfImprovement.windowSize > 0
           ? `prev ${selfImprovement.windowSize}`
           : "baseline";
@@ -770,8 +938,8 @@
           ],
           [
             "iEx/previous ratio",
-            previousIexAvailable ? `${fmt(previousIex.iexRatio?.median, 3)}x` : "n/a",
-            previousIexAvailable ? `${fmt(previousIex.iexRatio?.p95, 3)}x p95` : "n/a",
+            previousIexOverallRatio,
+            previousIexRecentRatio,
           ],
           [
             "Previous iEx ms",
@@ -983,18 +1151,26 @@
 
       function renderRunTable() {
         const rows = history.slice(-20).reverse();
+        const previousContextByProfile = buildProfileCompetitorContext("iex_previous");
         runTable.innerHTML = rows
           .map((run) => {
             const rg = asNum(run.rgMs, 0);
             const iex = asNum(run.iexMs, 0);
             const rgRatio = asNum(run.iexToRgRatio, rg > 0 ? iex / rg : 0);
             const previous = competitorRunMetrics(run, "iex_previous");
+            const previousContext = previousContextByProfile.get(run.profile) || null;
+            const previousRatioClass = previous.available
+              ? contextualRatioClass(previous.ratio, previousContext, previous)
+              : "muted";
+            const previousRatioTitle = previous.available
+              ? contextualRatioTitle(previous.ratio, previousContext, "iEx vs installed native", previous)
+              : "iEx vs installed native: unavailable";
             return `<tr>
               <td>${new Date(run.timestamp).toLocaleString()}</td>
               <td>${run.profile}</td>
               <td class="${ratioClass(rgRatio)}">${fmt(rgRatio, 3)}x</td>
               <td>${fmt(run.speedupPct)}%</td>
-              <td class="${previous.available ? ratioClass(previous.ratio) : "muted"}">${previous.available ? `${fmt(previous.ratio, 3)}x` : "n/a"}</td>
+              <td class="${previousRatioClass}" title="${previousRatioTitle}">${previous.available ? `${fmt(previous.ratio, 3)}x` : "n/a"}</td>
               <td>${previous.available ? `${fmt(previous.speedupPct)}%` : "n/a"}</td>
               <td>${fmt(iex)}</td>
               <td>${fmt(rg)}</td>

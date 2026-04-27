@@ -17,26 +17,26 @@ jobs:
           - os: windows-latest
             label: windows-x64
             artifact_name: iex-windows-x64
-            binary_path: target/release/iex-cli.exe
-            packaged_binary_name: iex.exe
+            binary_path: target/release/ix.exe
+            packaged_binary_name: ix.exe
             archive_ext: zip
           - os: ubuntu-latest
             label: linux-x64
             artifact_name: iex-linux-x64
-            binary_path: target/release/iex-cli
-            packaged_binary_name: iex
+            binary_path: target/release/ix
+            packaged_binary_name: ix
             archive_ext: tar.gz
           - os: macos-13
             label: macos-x64
             artifact_name: iex-macos-x64
-            binary_path: target/release/iex-cli
-            packaged_binary_name: iex
+            binary_path: target/release/ix
+            packaged_binary_name: ix
             archive_ext: tar.gz
           - os: macos-14
             label: macos-arm64
             artifact_name: iex-macos-arm64
-            binary_path: target/release/iex-cli
-            packaged_binary_name: iex
+            binary_path: target/release/ix
+            packaged_binary_name: ix
             archive_ext: tar.gz
 
     steps:
@@ -75,4 +75,3 @@ jobs:
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.artifact_name }}.${{ matrix.archive_ext }}
-

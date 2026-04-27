@@ -2,7 +2,10 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use iex_core::{run_search, ExpressionPlan, SearchConfig};
+use iex_core::{
+    prepare_search_targets, run_search_prepared, ExpressionPlan, PreparedSearchOptions,
+    SearchConfig,
+};
 use serde::Serialize;
 
 #[derive(Parser, Debug)]
@@ -31,6 +34,7 @@ struct BenchArgs {
 
 #[derive(Debug, Serialize)]
 struct BenchSummary {
+    scenario: BenchScenario,
     expression: String,
     loops: usize,
     warmup: usize,
@@ -41,19 +45,52 @@ struct BenchSummary {
     runs_ms: Vec<f64>,
 }
 
+#[derive(Debug, Serialize)]
+struct BenchScenario {
+    id: &'static str,
+    intent: &'static str,
+    discovery_contract: &'static str,
+    execution_mode: &'static str,
+    prepared_targets: bool,
+    prepared_setup_ms: f64,
+    file_count: usize,
+    max_path_depth: usize,
+    lazy_path_index_enabled: bool,
+}
+
 fn main() -> Result<()> {
     let args = BenchArgs::parse();
     let plan = ExpressionPlan::parse(&args.expr)?;
+    let prepared_started = std::time::Instant::now();
+    let prepared_targets = prepare_search_targets(
+        args.paths.clone(),
+        PreparedSearchOptions {
+            include_hidden: false,
+            follow_symlinks: false,
+        },
+    )?;
+    let prepared_setup_ms = prepared_started.elapsed().as_secs_f64() * 1_000.0;
+    let scenario = BenchScenario {
+        id: "prepared_corpus_replay",
+        intent: "Replay the same prepared corpus across warmup and measured loops without repaying discovery.",
+        discovery_contract: "Discovery and root normalization happen once before warmup; each measured loop reuses the prepared file set.",
+        execution_mode: "materialized_prepared",
+        prepared_targets: true,
+        prepared_setup_ms,
+        file_count: prepared_targets.file_count(),
+        max_path_depth: prepared_targets.max_path_depth(),
+        lazy_path_index_enabled: prepared_targets.lazy_path_index_enabled(),
+    };
     let mut config = SearchConfig::from_roots(args.paths.clone(), plan);
     config.threads = args.threads;
 
     for _ in 0..args.warmup {
-        run_search(&config)?;
+        run_search_prepared(&config, &prepared_targets)?;
     }
 
     let mut runs = Vec::with_capacity(args.loops);
     for _ in 0..args.loops {
-        let report = run_search(&config)?;
+        let report = run_search_prepared(&config, &prepared_targets)?;
         runs.push(report.stats.timings.total_ms);
     }
 
@@ -77,6 +114,7 @@ fn main() -> Result<()> {
         .unwrap_or(0.0);
 
     let summary = BenchSummary {
+        scenario,
         expression: args.expr,
         loops: args.loops,
         warmup: args.warmup,

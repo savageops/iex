@@ -32,18 +32,18 @@ The repo target is explicit: beat ripgrep on transparent benchmark suites. The o
 cargo install iex-cli
 
 # Agent-friendly rg-style ingress for simple searches
-iex timeout .
-iex -F -i "session timeout" .
-iex -e timeout -e error .
+ix timeout .
+ix -F -i "session timeout" .
+ix -e timeout -e error .
 
 # Structured JSON output
-iex search "lit:error && re:\btimeout\b" . --json
+ix search "lit:error && re:\btimeout\b" . --json
 
 # Count-only mode, maximum throughput, no hit payload
-iex search "re:CVE-\d{4}-\d{4,6}" . --stats-only --json
+ix search "re:CVE-\d{4}-\d{4,6}" . --stats-only --json
 
 # Inspect the execution path a predicate compiles to
-iex explain "lit:breach && lit:auth"
+ix explain "lit:breach && lit:auth"
 ```
 
 **Binaries (no Rust required):** [github.com/savageops/iEx/releases](https://github.com/savageops/iEx/releases)
@@ -52,16 +52,16 @@ iex explain "lit:breach && lit:auth"
 
 ## rg-style ingress compatibility
 
-`iex search` and `iex explain` remain the canonical iEx CLI surface. For agent-friendly local search, iEx also accepts a narrow ripgrep-shaped ingress layer and lowers it into the same native search path.
+`ix search` and `ix explain` are the canonical command surface for the iEx engine. The Cargo package remains `iex-cli`; the operator-facing binary is `ix` so shell usage stays short and avoids PowerShell's built-in `iex` alias. For agent-friendly local search, iEx also accepts a narrow ripgrep-shaped ingress layer and lowers it into the same native search path.
 
-- `iex PATTERN [PATH]...`
-- `iex -e PATTERN [PATH]...`
-- `iex -F`
-- `iex -i`
-- `iex -j`
-- `iex -n` as a no-op
-- `iex --json`
-- `iex --hidden`
+- `ix PATTERN [PATH]...`
+- `ix -e PATTERN [PATH]...`
+- `ix -F`
+- `ix -i`
+- `ix -j`
+- `ix -n` as a no-op
+- `ix --json`
+- `ix --hidden`
 
 If a request falls outside that subset, iEx returns a guided non-zero error instead of trying to emulate full ripgrep behavior.
 
@@ -69,7 +69,7 @@ If a request falls outside that subset, iEx returns a guided non-zero error inst
 
 ## Expression language
 
-An explicit predicate syntax with native boolean composition. The expression plan is compiled once at parse time and does not change during execution. Use `iex explain` to inspect the machine a pattern lowers to before running a search.
+An explicit predicate syntax with native boolean composition. The expression plan is compiled once at parse time and does not change during execution. Use `ix explain` to inspect the machine a pattern lowers to before running a search.
 
 | Predicate | Semantics | Example |
 |---|---|---|
@@ -90,7 +90,14 @@ iEx keeps three benchmark surfaces aligned:
 
 - canonical external raw baseline: `npm run bench:report` -> `tools/reports/bench/ripgrep-benchsuite-*.csv`
 - live operator diagnostics: `npm run bench:loop` -> `tools/reports/live-metrics.jsonl`
-- exact binary proof: timestamped `tools/reports/candidate-compare/iex-cli-*.exe` snapshots plus compare artifacts
+- exact binary proof: timestamped `tools/reports/candidate-compare/ix-*.exe` snapshots plus compare artifacts; older `iex-cli-*.exe` snapshots remain immutable historical proof
+
+Current Windows proof snapshot, captured in `tools/reports/candidate-compare/110-ix-current-vs-installed-20260427-233905/summary.json`:
+- current build: `target/release/ix.exe`
+- installed predecessor comparator: `C:\Users\Savage\AppData\Local\Programs\iEx\bin\iex.exe`
+- suite shape: `12/12` wins versus ripgrep and `9/12` wins versus the installed predecessor on the three-sample dashboard suite
+- exact focused recheck: `suite-en-alternates` is green at `0.9679x` versus installed; confirmed predecessor-loss frontier is `suite-linux-no-literal` at `1.0974x` and `suite-linux-word` at `1.0286x`
+- active cost center: Linux scan lanes, `144,017,913` dominant targeted bytes, no dominant shard activation, top tail files in AMD ASIC register headers
 
 Key live fields:
 - `iexMs`, `iexCliMs`, and `iexProcessOverheadMs`
@@ -232,6 +239,22 @@ The Teddy SIMD backend, ported from Intel Hyperscan, activates via `.packed(Some
 
 The decomposition path is intentionally narrower than a generic regex prefilter story. It only activates when the planner can prove one strong required literal, no better fast path already owns the pattern, and candidate-line volume stays below the bailout ceiling.
 
+### Regex decomposition byte sharding
+
+`RegexDecomposition` uses byte sharding as a bounded literal-discovery accelerator, not as arbitrary parallel regex execution. The planner first proves a required literal anchor, then shards only the full-buffer anchor walk. Each shard owns candidate literal starts inside its byte interval and reads a right-extended window so boundary-crossing anchors remain visible without transferring ownership to the neighboring shard. Context gates evaluate against the full haystack, never a truncated shard slice.
+
+After shard-local discovery, iEx merges candidate line starts globally with `sort_unstable` plus `dedup`. Full `regex::bytes` confirmation runs once per unique candidate line, preserving serial match-count semantics while avoiding duplicate confirmations when multiple anchors land on one line or a candidate line crosses a shard seam. The current activation gate is intentionally small: stats-only regex decomposition, one outer scan thread, file length at least `64 MiB`, and at most two shard workers.
+
+| Phase | Byte-sharding invariant |
+| --- | --- |
+| Anchor discovery | Parallel `memmem`-style literal traversal over owned byte intervals. |
+| Boundary handling | Right-extended scan windows expose seam-spanning anchors. |
+| Candidate ownership | Candidate starts are credited only to the shard-owned byte range. |
+| Context filtering | Guards read the original full buffer so lookaround context is exact. |
+| Regex confirmation | Unique candidate lines are confirmed once with `regex::bytes`. |
+
+This shifts the hot work from one serial full-buffer anchor pass into owned byte-range passes while keeping regex execution sparse and exact. In the retained `suite-en-surrounding-words` proof, the lane moved from `42.55 ms` on the pre-change snapshot to `27.92 ms` with `39/39` match-count parity. Operators can verify activation through `sharding_enabled`, `max_shard_threads`, `max_shard_ranges`, and the `regexDecomposition` report block.
+
 </details>
 
 <details>
@@ -343,7 +366,8 @@ The repo currently defines one explicit performance-focused profile in `Cargo.to
 | `release-lto` | `lto = "fat"` | whole-program optimization across crate boundaries |
 | `release-lto` | `codegen-units = 1` | larger inlining surface and slower build, faster proof binary |
 
-Benchmark proof should always record the exact binary path it used instead of assuming a profile name or mutable `target/release/iex-cli.exe` state.
+Benchmark proof should always record the exact binary path it used instead of assuming a profile name or mutable `target/release/ix.exe` state.
+During the command rename, `target/release/ix.exe` is the primary benchmark binary while `target/release/iex-cli.exe` remains available as a compatibility build artifact.
 
 </details>
 
@@ -355,14 +379,14 @@ Benchmark proof should always record the exact binary path it used instead of as
 
 | Platform | Binary |
 |---|---|
-| Windows | `iex.exe` |
-| Linux / macOS | `iex` |
+| Windows | `ix.exe` |
+| Linux / macOS | `ix` |
 
 **From source:**
 
 ```sh
 cargo build --release -p iex-cli
-# target/release/iex-cli
+# target/release/ix
 ```
 
 ---
