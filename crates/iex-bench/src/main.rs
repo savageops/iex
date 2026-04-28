@@ -9,7 +9,7 @@ use iex_core::{
 use serde::Serialize;
 
 #[derive(Parser, Debug)]
-#[command(name = "iex-bench", about = "Loop benchmark helper for iEx")]
+#[command(name = "iex-bench", about = "Loop benchmark helper for IX")]
 struct BenchArgs {
     #[arg(help = "Expression used for each benchmark iteration")]
     expr: String,

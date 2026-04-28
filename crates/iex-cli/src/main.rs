@@ -8,7 +8,7 @@ use regex::escape as regex_escape;
 #[derive(Parser, Debug)]
 #[command(
     name = "ix",
-    about = "iEx v2 intelligent expression search CLI",
+    about = "IX v2 intelligent expression search CLI",
     after_help = "Compatibility: `ix PATTERN [PATH]...` accepts a narrow rg-style search subset for agent-friendly ingress. Canonical native commands remain `ix search <expr> [PATH]...` and `ix explain <expr>`."
 )]
 struct Cli {
@@ -64,7 +64,7 @@ struct SearchArgs {
 
 #[derive(Args, Debug)]
 struct ExplainArgs {
-    #[arg(help = "Expression to parse into iEx plan")]
+    #[arg(help = "Expression to parse into IX plan")]
     expr: String,
 }
 
@@ -154,7 +154,7 @@ fn format_compat_parse_error(raw_args: &[OsString], kind: ErrorKind) -> String {
     if let Some(flag) = first_unsupported_compat_flag(raw_args) {
         let supported = "`ix PATTERN [PATH]...`, `-e/--regexp`, `-F/--fixed-strings`, `-i/--ignore-case`, `-j/--threads`, `-n/--line-number`, `--json`, and `--hidden`";
         return format!(
-            "rg-style compatibility does not support `{flag}`. Supported subset: {supported}. Use `ix search <expr> [PATH]...` for native iEx syntax."
+            "rg-style compatibility does not support `{flag}`. Supported subset: {supported}. Use `ix search <expr> [PATH]...` for native IX syntax."
         );
     }
 
@@ -168,7 +168,7 @@ fn format_compat_parse_error(raw_args: &[OsString], kind: ErrorKind) -> String {
 
     let supported = "`ix PATTERN [PATH]...`, `-e/--regexp`, `-F/--fixed-strings`, `-i/--ignore-case`, `-j/--threads`, `-n/--line-number`, `--json`, and `--hidden`";
     format!(
-        "rg-style compatibility could not classify this search request. Supported subset: {supported}. Use `ix search <expr> [PATH]...` for native iEx syntax."
+        "rg-style compatibility could not classify this search request. Supported subset: {supported}. Use `ix search <expr> [PATH]...` for native IX syntax."
     )
 }
 
@@ -294,7 +294,7 @@ fn lower_compat_expression(
     if patterns.len() == 1 && looks_like_iex_expression(&patterns[0]) {
         if fixed_strings || ignore_case {
             bail!(
-                "native iEx expressions cannot be combined with `-F` or `-i` in rg-style compatibility mode. Use `ix search <expr> [PATH]...` instead."
+                "native IX expressions cannot be combined with `-F` or `-i` in rg-style compatibility mode. Use `ix search <expr> [PATH]...` instead."
             );
         }
         return Ok(patterns[0].trim().to_owned());
@@ -310,7 +310,7 @@ fn lower_compat_expression(
             .any(|pattern| pattern.contains("&&") || pattern.contains("||"))
     {
         bail!(
-            "regex patterns containing `&&` or `||` are ambiguous with native iEx boolean operators. Use `ix search <expr> [PATH]...` for this pattern."
+            "regex patterns containing `&&` or `||` are ambiguous with native IX boolean operators. Use `ix search <expr> [PATH]...` for this pattern."
         );
     }
 
@@ -383,7 +383,7 @@ fn run_search_command(args: SearchArgs) -> Result<()> {
         }
     }
 
-    println!("-- iEx Search Summary --");
+    println!("-- IX Search Summary --");
     println!("expression: {}", report.expression);
     println!("files discovered: {}", report.stats.files_discovered);
     println!("files scanned: {}", report.stats.files_scanned);

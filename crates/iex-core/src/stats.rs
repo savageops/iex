@@ -157,6 +157,45 @@ pub struct FastCountDensityStats {
     pub shard_merge_matches: usize,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
+pub struct ByteShardKernelStats {
+    pub enabled: bool,
+    pub files_profiled: usize,
+    pub range_calls: usize,
+    pub logical_range_bytes: usize,
+    pub widened_range_bytes: usize,
+    pub overlap_bytes: usize,
+    pub range_elapsed_ns_total: u64,
+    pub max_range_elapsed_ns: u64,
+    pub reduce_elapsed_ns_total: u64,
+    pub max_reduce_elapsed_ns: u64,
+    pub matches: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+pub struct FallbackLineScanStats {
+    pub enabled: bool,
+    pub files_profiled: usize,
+    pub line_count: usize,
+    pub candidate_lines: usize,
+    pub matched_lines: usize,
+    pub scanned_line_bytes: usize,
+    pub max_line_bytes: usize,
+    pub newline_elapsed_ns_total: u64,
+    pub regex_elapsed_ns_total: u64,
+    pub max_file_elapsed_ns: u64,
+    pub max_file_bytes: u64,
+    pub max_file_lines: usize,
+    pub max_file_matches: usize,
+    pub max_file_path: String,
+}
+
+impl FallbackLineScanStats {
+    pub fn is_inactive(&self) -> bool {
+        !self.enabled
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchStats {
     pub input_roots: usize,
@@ -175,6 +214,9 @@ pub struct SearchStats {
     pub regex_decomposition: RegexDecompositionStats,
     pub unicode_casefold_prefilter: UnicodeCaseFoldPrefilterStats,
     pub fast_count_density: FastCountDensityStats,
+    pub byte_shard_kernel: ByteShardKernelStats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_line_scan: Option<FallbackLineScanStats>,
     pub timings: PhaseTimings,
     pub concurrency: ConcurrencyStats,
     pub slowest_files: Vec<SlowFileStat>,
@@ -199,6 +241,8 @@ impl Default for SearchStats {
             regex_decomposition: RegexDecompositionStats::default(),
             unicode_casefold_prefilter: UnicodeCaseFoldPrefilterStats::default(),
             fast_count_density: FastCountDensityStats::default(),
+            byte_shard_kernel: ByteShardKernelStats::default(),
+            fallback_line_scan: None,
             timings: PhaseTimings::default(),
             concurrency: ConcurrencyStats::default(),
             slowest_files: Vec::new(),
@@ -331,6 +375,49 @@ impl SearchStats {
         self.fast_count_density.shard_merge_calls += telemetry.shard_merge_calls;
         self.fast_count_density.shard_merge_ranges += telemetry.shard_merge_ranges;
         self.fast_count_density.shard_merge_matches += telemetry.shard_merge_matches;
+    }
+
+    pub fn observe_byte_shard_kernel(&mut self, telemetry: ByteShardKernelStats) {
+        self.byte_shard_kernel.enabled |= telemetry.enabled;
+        self.byte_shard_kernel.files_profiled += telemetry.files_profiled;
+        self.byte_shard_kernel.range_calls += telemetry.range_calls;
+        self.byte_shard_kernel.logical_range_bytes += telemetry.logical_range_bytes;
+        self.byte_shard_kernel.widened_range_bytes += telemetry.widened_range_bytes;
+        self.byte_shard_kernel.overlap_bytes += telemetry.overlap_bytes;
+        self.byte_shard_kernel.range_elapsed_ns_total += telemetry.range_elapsed_ns_total;
+        self.byte_shard_kernel.max_range_elapsed_ns = self
+            .byte_shard_kernel
+            .max_range_elapsed_ns
+            .max(telemetry.max_range_elapsed_ns);
+        self.byte_shard_kernel.reduce_elapsed_ns_total += telemetry.reduce_elapsed_ns_total;
+        self.byte_shard_kernel.max_reduce_elapsed_ns = self
+            .byte_shard_kernel
+            .max_reduce_elapsed_ns
+            .max(telemetry.max_reduce_elapsed_ns);
+        self.byte_shard_kernel.matches += telemetry.matches;
+    }
+
+    pub fn observe_fallback_line_scan(&mut self, telemetry: Option<FallbackLineScanStats>) {
+        let Some(telemetry) = telemetry else {
+            return;
+        };
+        let aggregate = self.fallback_line_scan.get_or_insert_with(Default::default);
+        aggregate.enabled |= telemetry.enabled;
+        aggregate.files_profiled += telemetry.files_profiled;
+        aggregate.line_count += telemetry.line_count;
+        aggregate.candidate_lines += telemetry.candidate_lines;
+        aggregate.matched_lines += telemetry.matched_lines;
+        aggregate.scanned_line_bytes += telemetry.scanned_line_bytes;
+        aggregate.max_line_bytes = aggregate.max_line_bytes.max(telemetry.max_line_bytes);
+        aggregate.newline_elapsed_ns_total += telemetry.newline_elapsed_ns_total;
+        aggregate.regex_elapsed_ns_total += telemetry.regex_elapsed_ns_total;
+        if telemetry.max_file_elapsed_ns > aggregate.max_file_elapsed_ns {
+            aggregate.max_file_elapsed_ns = telemetry.max_file_elapsed_ns;
+            aggregate.max_file_bytes = telemetry.max_file_bytes;
+            aggregate.max_file_lines = telemetry.max_file_lines;
+            aggregate.max_file_matches = telemetry.max_file_matches;
+            aggregate.max_file_path = telemetry.max_file_path;
+        }
     }
 
     pub fn consider_slow_file(

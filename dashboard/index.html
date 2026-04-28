@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>iEx Benchmark Dashboard</title>
+    <title>IX Benchmark Dashboard</title>
     <style>
       :root {
         --bg: #070c15;
@@ -190,7 +190,7 @@
   <body>
     <main class="wrap">
       <section class="card">
-        <h1>iEx Benchmark Monitor</h1>
+        <h1>IX Benchmark Monitor</h1>
         <p class="muted">Median and p95 ranges, slowdown phase attribution, and live run diagnostics.</p>
         <p class="muted">This page summarizes the live diagnostics feed from <code>npm run bench:loop</code> and surfaces the latest raw ripgrep benchsuite artifact from <code>npm run bench:report</code> for provenance.</p>
         <p class="muted">Canonical raw baseline: <code>bench:report</code>. Live monitor feed: <code>bench:loop</code> into <code>tools/reports/live-metrics.jsonl</code>.</p>
@@ -258,8 +258,8 @@
               <th>Measured Runs</th>
               <th>Median ms</th>
               <th>P95 ms</th>
-              <th>Median Ratio (iEx/competitor)</th>
-              <th>iEx Faster %</th>
+              <th>Median Ratio (IX/competitor)</th>
+              <th>IX Faster %</th>
               <th>Status</th>
             </tr>
           </thead>
@@ -270,7 +270,7 @@
 
       <section class="card">
         <div class="section-bar">
-          <h2>Ratio Trend (iEx/rg + iEx/previous)</h2>
+          <h2>Ratio Trend (IX/rg + IX/previous)</h2>
           <div class="segmented-control" id="trend-window-controls" role="group" aria-label="Ratio trend window">
             <button type="button" data-trend-window="1h" aria-pressed="false">1h</button>
             <button type="button" data-trend-window="12h" aria-pressed="true" class="is-active">12h</button>
@@ -280,13 +280,13 @@
           </div>
         </div>
         <div class="trend-legend" aria-hidden="true">
-          <span class="trend-legend-item" style="color:#6ec7ff"><span class="trend-legend-swatch"></span>iEx/rg</span>
-          <span class="trend-legend-item" style="color:#ff7a8a"><span class="trend-legend-swatch"></span>iEx/previous</span>
+          <span class="trend-legend-item" style="color:#6ec7ff"><span class="trend-legend-swatch"></span>IX/rg</span>
+          <span class="trend-legend-item" style="color:#ff7a8a"><span class="trend-legend-swatch"></span>IX/previous</span>
           <span class="trend-legend-item" style="color:#f3b04a"><span class="trend-legend-swatch"></span>1.0x parity</span>
         </div>
         <p class="muted trend-meta" id="trend-meta">n/a</p>
         <canvas id="ratio-trend" width="1280" height="320"></canvas>
-        <p class="muted">1.0x baseline means parity. Above 1.0x means iEx is slower. Below 1.0x means iEx is faster. The previous-build lane only renders when a previous iEx snapshot was configured for the run.</p>
+        <p class="muted">1.0x baseline means parity. Above 1.0x means IX is slower. Below 1.0x means IX is faster. The previous-build lane only renders when a previous IX snapshot was configured for the run.</p>
       </section>
 
       <section class="grid-2">
@@ -335,13 +335,13 @@
             <tr>
               <th>Timestamp</th>
               <th>Profile</th>
-              <th>iEx/rg</th>
+              <th>IX/rg</th>
               <th>vs rg %</th>
-              <th>iEx/prev</th>
+              <th>IX/prev</th>
               <th>vs prev %</th>
-              <th>iEx ms</th>
+              <th>IX ms</th>
               <th>rg ms</th>
-              <th>prev iEx ms</th>
+              <th>prev IX ms</th>
               <th>Hotspot</th>
             </tr>
           </thead>
@@ -872,13 +872,13 @@
           ["Ratio CV", `${fmt(ratio.cvPct)}%`],
           ["Primary Challenger", `${primaryChallenger?.name || "n/a"}`],
           [
-            "iEx/Challenger",
+            "IX/Challenger",
             primaryChallenger
               ? `<span class="${ratioClass(asNum(primaryChallenger?.iexRatio?.median, 0))}">${ratioLabel(asNum(primaryChallenger?.iexRatio?.median, 0))}</span>`
               : "n/a",
           ],
           [
-            "iEx/Previous",
+            "IX/Previous",
             previousIexRatioText,
           ],
         ];
@@ -932,22 +932,22 @@
             challenger ? `${fmt(challenger.durationMs?.median)} ms median` : "n/a",
           ],
           [
-            "iEx/challenger ratio",
+            "IX/challenger ratio",
             challenger ? `${fmt(challenger.iexRatio?.median, 3)}x` : "n/a",
             challenger ? `${fmt(challenger.iexRatio?.p95, 3)}x p95` : "n/a",
           ],
           [
-            "iEx/previous ratio",
+            "IX/previous ratio",
             previousIexOverallRatio,
             previousIexRecentRatio,
           ],
           [
-            "Previous iEx ms",
+            "Previous IX ms",
             previousIexAvailable ? `${fmt(previousIex.durationMs?.median)} median` : "n/a",
             previousIexAvailable ? `${fmt(previousIex.durationMs?.p95)} p95` : "n/a",
           ],
           [
-            "Self iEx Median ms",
+            "Self IX Median ms",
             selfImprovement.available ? `${fmt(selfImprovement.baselineIexMs)} (${selfWindowLabel})` : "n/a",
             selfImprovement.available ? `${fmt(selfImprovement.recentIexMs)} (${selfRecentLabel})` : "n/a",
           ],
@@ -1050,7 +1050,7 @@
         const startLabel = runs[0]?.timestamp ? new Date(runs[0].timestamp).toLocaleString() : "n/a";
         const endLabel = runs[runs.length - 1]?.timestamp ? new Date(runs[runs.length - 1].timestamp).toLocaleString() : "n/a";
         const previousCoverage = previousRatios.filter((value) => Number.isFinite(value) && value > 0).length;
-        trendMeta.textContent = `Showing ${trendWindowConfig().label} • ${runs.length} runs • ${startLabel} -> ${endLabel} • previous iEx coverage ${previousCoverage}/${runs.length}`;
+        trendMeta.textContent = `Showing ${trendWindowConfig().label} • ${runs.length} runs • ${startLabel} -> ${endLabel} • previous IX coverage ${previousCoverage}/${runs.length}`;
 
         function yFor(value) {
           return pad + h - ((value - minY) / (maxY - minY || 1)) * h;
@@ -1163,8 +1163,8 @@
               ? contextualRatioClass(previous.ratio, previousContext, previous)
               : "muted";
             const previousRatioTitle = previous.available
-              ? contextualRatioTitle(previous.ratio, previousContext, "iEx vs installed native", previous)
-              : "iEx vs installed native: unavailable";
+              ? contextualRatioTitle(previous.ratio, previousContext, "IX vs installed native", previous)
+              : "IX vs installed native: unavailable";
             return `<tr>
               <td>${new Date(run.timestamp).toLocaleString()}</td>
               <td>${run.profile}</td>

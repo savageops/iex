@@ -711,6 +711,32 @@ impl ExpressionPlan {
         }
     }
 
+    pub fn fast_match_count_range_overlap(&self) -> Option<usize> {
+        match self.compiled.as_slice() {
+            [Predicate::Regex { fast_path, .. }] => match fast_path {
+                Some(RegexFastPath::PlainLiteral { needle_len, .. }) => {
+                    Some(needle_len.saturating_sub(1))
+                }
+                Some(RegexFastPath::AsciiCaseFoldLiteral { searcher, .. }) => {
+                    Some(searcher.needle_len().saturating_sub(1))
+                }
+                Some(RegexFastPath::FixedWidthBytesRegex { match_len }) => {
+                    Some(match_len.saturating_sub(1))
+                }
+                Some(RegexFastPath::WordBoundaryLiteral { literal, .. }) => Some(literal.len()),
+                Some(RegexFastPath::AsciiCaseFoldWordBoundaryLiteral { searcher }) => {
+                    Some(searcher.needle_len())
+                }
+                Some(RegexFastPath::LiteralAlternates {
+                    max_literal_len, ..
+                }) => Some(max_literal_len.saturating_sub(1)),
+                None => None,
+            },
+            [Predicate::Literal { bytes, .. }] => Some(bytes.len().saturating_sub(1)),
+            _ => None,
+        }
+    }
+
     pub fn fast_match_count_no_hits_bytes_in_range_with_stats(
         &self,
         haystack: &[u8],
@@ -1980,6 +2006,25 @@ mod tests {
     fn alternates_fast_path_respects_leftmost_first_order() {
         let plan = ExpressionPlan::parse(r"re:(a|aa)").expect("plan should parse");
         assert_eq!(plan.fast_match_count_no_hits_bytes(b"aa"), Some(2));
+    }
+
+    #[test]
+    fn alternates_range_count_matches_whole_file_count_across_shard_boundaries() {
+        let plan = ExpressionPlan::parse(r"re:(abc|ab)").expect("plan should parse");
+        let haystack = b"xxabcabyyabczzab";
+        let ranges = [(0, 4), (4, 9), (9, haystack.len())];
+        let range_count = ranges
+            .iter()
+            .map(|(start, end)| {
+                plan.fast_match_count_no_hits_bytes_in_range(haystack, *start, *end)
+                    .expect("alternates fast path should support range counts")
+            })
+            .sum::<usize>();
+
+        assert_eq!(
+            plan.fast_match_count_no_hits_bytes(haystack),
+            Some(range_count)
+        );
     }
 
     #[test]

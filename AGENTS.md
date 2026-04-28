@@ -1,7 +1,7 @@
 # AGENTS.md
 
 ## Mission
-Build iEx v2 as a simple, clean, capability-complete Rust search engine and benchmark platform. Simplicity is for tidiness and slop avoidance, never for capability loss. Primary performance objective: become faster than ripgrep and other top search competitors (for example fff and codedb) on transparent benchmark suites, with a tracked target of at least 50% faster versus ripgrep on agreed workloads.
+Build IX v2 as a simple, clean, capability-complete Rust search engine and benchmark platform. Simplicity is for tidiness and slop avoidance, never for capability loss. Primary performance objective: become faster than ripgrep and other top search competitors (for example fff and codedb) on transparent benchmark suites, with a tracked target of at least 50% faster versus ripgrep on agreed workloads.
 
 ## Core Patterns (Required)
 - `ATOMIC`: ship one coherent slice at a time.
@@ -33,7 +33,7 @@ Build iEx v2 as a simple, clean, capability-complete Rust search engine and benc
 - Minimum change means minimum durable architecture change, not minimum typing.
 - When a performance regression resists local explanations, zoom out from the immediate branch or gate and re-price the whole workload shape before editing more control flow. Check retained bytes, slowest files, and tail-dominant surfaces first so the fix targets the real bottleneck instead of the loudest symptom.
 - Prefer narrow repairs at the dominant cost center over another broad scheduler toggle. If a few giant files are setting the tail, fix scan-kernel or ownership behavior there first, then revisit higher-level traversal doctrine from the lower tail-tax floor.
-- Native predecessor parity is a hard performance contract. A suite split near parity, such as 6 wins and 6 losses against the installed previous iEx binary, means the investigation is not done even when individual wins are impressive. Use the previous/native binary as the floor to beat, not as a loose comparison target.
+- Native predecessor parity is a hard performance contract. A suite split near parity, such as 6 wins and 6 losses against the installed previous IX binary, means the investigation is not done even when individual wins are impressive. Use the previous/native binary as the floor to beat, not as a loose comparison target.
 - Treat benchmark glare as hostile. Before editing, dive below headline ratios into byte-level workload shape, retained byte volume, candidate filters, regex decomposition, byte charting, match density, thread topology, shard geometry, aggregation cost, and slowest-file tails. The target is the actual cost center, not the most visible branch.
 - Never promote assumption-first optimization. When a candidate idea is still unproven, isolate its core mechanism in the smallest removable slice that can be benchmarked against the current canonical binary and the installed native binary. Expand only after repeated interleaved samples show a real average win with match-count parity.
 - Research must be specific and demand-driven. If byte charting, regex execution, SIMD/memmem behavior, Aho-Corasick strategy, thread scheduling, cache locality, or Windows filesystem behavior becomes the active unknown, use focused web/Insect research on that exact mechanism before designing the durable fix. Do not perform broad topic surveys as a substitute for profiling the live lane.
@@ -55,7 +55,7 @@ Build iEx v2 as a simple, clean, capability-complete Rust search engine and benc
 
 When the user asks for deep research, interpret depth as implementation-level file-search knowledge: engine internals, byte scanning, regex execution strategy, automata construction, SIMD/memmem behavior, cache locality, branch behavior, allocation pressure, shard scheduling, reduction geometry, Windows I/O, corpus distribution, benchmark statistics, and source-level precedent from serious search engines. The research bar is below the public headline and inside the mechanism: source code, maintainer issue threads, benchmark harnesses, papers, talks, profiler traces, and failure reports that explain why a path is slow or fast.
 
-Do not flatten "deep" into generic web summaries, and do not reinterpret it as a cybersecurity objective. The target is faster lawful file search. Search language should be technically sharp enough to surface advanced implementation discussions while staying focused on benign performance engineering: exact algorithm names, hot-loop costs, false-positive rates, memory traffic, scheduling overhead, match-count semantics, and workload-specific evidence. Every imported idea must still pass the iEx proof loop: smallest removable probe, match-count parity, interleaved current-vs-installed benchmarks, retained only when neutral or faster.
+Do not flatten "deep" into generic web summaries, and do not reinterpret it as a cybersecurity objective. The target is faster lawful file search. Search language should be technically sharp enough to surface advanced implementation discussions while staying focused on benign performance engineering: exact algorithm names, hot-loop costs, false-positive rates, memory traffic, scheduling overhead, match-count semantics, and workload-specific evidence. Every imported idea must still pass the IX proof loop: smallest removable probe, match-count parity, interleaved current-vs-installed benchmarks, retained only when neutral or faster.
 
 ### Performance Candidate Retention Discipline
 
@@ -81,7 +81,7 @@ Deep iteration does not weaken the gate. Research produces a testable hypothesis
 - Don't degrade readability to chase novelty.
 
 ## Why These Rules Exist
-- To keep iEx fast, reliable, and maintainable under aggressive iteration.
+- To keep IX fast, reliable, and maintainable under aggressive iteration.
 - To prevent architectural drift and duplicate ownership.
 - To ensure every capability has a measurable contract.
 - To keep delivery quality high without codebase entropy.
@@ -114,7 +114,7 @@ Deep iteration does not weaken the gate. Research produces a testable hypothesis
 - Test matrix materialized and passing for changed contracts.
 - Benchmark evidence captured with reproducible commands and the timestamped pre-rebuild canonical-binary snapshot path.
 - For performance work, the edited binary is measured against the current canonical binary and only promoted when the comparison proves the change is neutral or better on the target workload.
-- For native predecessor work, the edited binary is measured against the installed previous iEx binary with enough interleaved samples to show median improvement and acceptable win-pair direction; 6/6 suite splits require another investigation slice.
+- For native predecessor work, the edited binary is measured against the installed previous IX binary with enough interleaved samples to show median improvement and acceptable win-pair direction; 6/6 suite splits require another investigation slice.
 - For deep optimization work, the final handoff names the specific cost center investigated, the proof slice attempted, the artifact proving win or loss, and the next lower-level mechanism to inspect.
 - For rejected performance candidates, the final handoff records the hypothesis, code seam, proof artifact, repeated-sample decision, revert evidence, and the next ranked mechanism so the same invalid area is not blindly reopened.
 - If the active loop is updated, the promoted binary is an immutable snapshot and the dashboard telemetry is verified against that exact path after restart.

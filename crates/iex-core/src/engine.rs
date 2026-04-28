@@ -22,8 +22,8 @@ use serde::Serialize;
 use crate::{
     expr::{ExpressionPlan, FastCountOutcome, FastDecompositionResult},
     stats::{
-        FastCountDensityStats, LinuxStrategyStats, RegexDecompositionStats, SearchStats,
-        UnicodeCaseFoldPrefilterStats,
+        ByteShardKernelStats, FallbackLineScanStats, FastCountDensityStats, LinuxStrategyStats,
+        RegexDecompositionStats, SearchStats, UnicodeCaseFoldPrefilterStats,
     },
 };
 
@@ -113,6 +113,8 @@ struct FileScanOutcome {
     regex_decomposition: RegexDecompositionStats,
     unicode_casefold_prefilter: UnicodeCaseFoldPrefilterStats,
     fast_count_density: FastCountDensityStats,
+    byte_shard_kernel: ByteShardKernelStats,
+    fallback_line_scan: Option<Box<FallbackLineScanStats>>,
     scanned: bool,
     shard_plan: Option<ParallelShardPlan>,
     linux_dominant_target: bool,
@@ -143,6 +145,12 @@ struct StreamingScanResult {
     duplicate_paths: usize,
     discover_ms: f64,
     scan_ms: f64,
+}
+
+#[derive(Debug)]
+struct ShardRangeCount {
+    outcome: FastCountOutcome,
+    kernel: ByteShardKernelStats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -466,6 +474,7 @@ fn run_search_materialized(
         run_plan.execution_mode.as_str(),
     ));
     let scan_started = Instant::now();
+    let fallback_line_profile = !config.collect_hits && fallback_line_profile_enabled();
     let mut outcomes = scan_paths(
         &discovery.files,
         &config.plan,
@@ -473,6 +482,7 @@ fn run_search_materialized(
         config.max_hits,
         concurrency,
         run_plan.outer_scan_threads,
+        fallback_line_profile,
     )?;
     stats.timings.scan_ms = scan_started.elapsed().as_secs_f64() * 1_000.0;
 
@@ -554,6 +564,7 @@ fn run_search_materialized_prepared(
         run_plan.execution_mode.as_str(),
     ));
     let scan_started = Instant::now();
+    let fallback_line_profile = !config.collect_hits && fallback_line_profile_enabled();
     let mut outcomes = scan_paths(
         prepared_targets.files(),
         &config.plan,
@@ -561,6 +572,7 @@ fn run_search_materialized_prepared(
         config.max_hits,
         concurrency,
         run_plan.outer_scan_threads,
+        fallback_line_profile,
     )?;
     stats.timings.scan_ms = scan_started.elapsed().as_secs_f64() * 1_000.0;
 
@@ -1000,8 +1012,14 @@ fn run_search_streaming_stats_only(
     let total_started = Instant::now();
     let mut stats = SearchStats::default();
     let hits = Vec::new();
-    let streaming =
-        scan_paths_streaming_stats_only(config, &roots, concurrency, run_plan.outer_scan_threads)?;
+    let fallback_line_profile = fallback_line_profile_enabled();
+    let streaming = scan_paths_streaming_stats_only(
+        config,
+        &roots,
+        concurrency,
+        run_plan.outer_scan_threads,
+        fallback_line_profile,
+    )?;
 
     stats.input_roots = roots.telemetry.input_roots;
     stats.effective_roots = roots.telemetry.effective_roots;
@@ -1057,6 +1075,7 @@ fn scan_paths_streaming_stats_only(
     roots: &RootTargets,
     concurrency: ConcurrencyPlanner,
     resolved_threads: usize,
+    fallback_line_profile: bool,
 ) -> Result<StreamingScanResult> {
     let queue_depth = resolved_threads
         .saturating_mul(STREAMING_PATH_QUEUE_MULTIPLIER)
@@ -1084,6 +1103,7 @@ fn scan_paths_streaming_stats_only(
                         plan,
                         concurrency,
                         resolved_threads,
+                        fallback_line_profile,
                     );
                 });
             }
@@ -1145,6 +1165,7 @@ fn worker_scan_loop(
     plan: Arc<ExpressionPlan>,
     concurrency: ConcurrencyPlanner,
     resolved_threads: usize,
+    fallback_line_profile: bool,
 ) {
     loop {
         let path = match receiver.recv() {
@@ -1161,6 +1182,7 @@ fn worker_scan_loop(
                 None,
                 concurrency,
                 resolved_threads,
+                fallback_line_profile,
             ))
             .is_err()
         {
@@ -1209,6 +1231,7 @@ fn scan_paths(
     hit_limit: Option<usize>,
     concurrency: ConcurrencyPlanner,
     resolved_threads: usize,
+    fallback_line_profile: bool,
 ) -> Result<Vec<FileScanOutcome>> {
     if resolved_threads <= 1 {
         return Ok(files
@@ -1224,6 +1247,7 @@ fn scan_paths(
                     hit_limit,
                     concurrency,
                     resolved_threads,
+                    fallback_line_profile,
                 )
             })
             .collect());
@@ -1247,6 +1271,7 @@ fn scan_paths(
                     hit_limit,
                     concurrency,
                     resolved_threads,
+                    fallback_line_profile,
                 )
             })
             .collect()
@@ -1270,6 +1295,7 @@ fn merge_outcome(
         stats.observe_regex_decomposition(outcome.regex_decomposition);
         stats.observe_unicode_casefold_prefilter(outcome.unicode_casefold_prefilter);
         stats.observe_fast_count_density(outcome.fast_count_density);
+        stats.observe_byte_shard_kernel(outcome.byte_shard_kernel);
         stats.observe_linux_dominant_file_sample(outcome.linux_dominant_target, outcome.bytes);
         stats.observe_linux_dominant_file_execution(
             outcome.linux_dominant_file.eligible,
@@ -1285,6 +1311,7 @@ fn merge_outcome(
             outcome.bytes,
             outcome.linux_dominant_target,
         );
+        stats.observe_fallback_line_scan(outcome.fallback_line_scan.map(|telemetry| *telemetry));
         stats.matches_found += outcome.match_count;
         if let Some(shard_plan) = outcome.shard_plan {
             stats.observe_parallel_sharding(
@@ -1354,6 +1381,7 @@ fn scan_file(
     hit_limit: Option<usize>,
     concurrency: ConcurrencyPlanner,
     outer_scan_threads: usize,
+    fallback_line_profile: bool,
 ) -> FileScanOutcome {
     let started = Instant::now();
     let mut outcome = {
@@ -1378,6 +1406,7 @@ fn scan_file(
                 hit_limit,
                 concurrency,
                 outer_scan_threads,
+                fallback_line_profile,
                 &tiny[..tiny_read],
                 tiny_read as u64,
             )
@@ -1398,6 +1427,7 @@ fn scan_file(
                     hit_limit,
                     concurrency,
                     outer_scan_threads,
+                    fallback_line_profile,
                     &tiny,
                     tiny.len() as u64,
                 )
@@ -1430,6 +1460,7 @@ fn scan_file(
                         hit_limit,
                         concurrency,
                         outer_scan_threads,
+                        fallback_line_profile,
                         &bytes,
                         metadata.len(),
                     )
@@ -1449,6 +1480,7 @@ fn scan_file(
                         hit_limit,
                         concurrency,
                         outer_scan_threads,
+                        fallback_line_profile,
                         &mmap,
                         metadata.len(),
                     )
@@ -1469,6 +1501,7 @@ fn scan_loaded_bytes(
     hit_limit: Option<usize>,
     concurrency: ConcurrencyPlanner,
     outer_scan_threads: usize,
+    fallback_line_profile: bool,
     bytes: &[u8],
     file_bytes: u64,
 ) -> FileScanOutcome {
@@ -1482,6 +1515,8 @@ fn scan_loaded_bytes(
     let mut regex_decomposition = RegexDecompositionStats::default();
     let mut unicode_casefold_prefilter = UnicodeCaseFoldPrefilterStats::default();
     let mut fast_count_density = FastCountDensityStats::default();
+    let mut byte_shard_kernel = ByteShardKernelStats::default();
+    let mut fallback_line_scan = None::<Box<FallbackLineScanStats>>;
     let mut linux_dominant_file = LinuxDominantFileExecution {
         eligible: linux_dominant_file_gate(
             path,
@@ -1496,15 +1531,18 @@ fn scan_loaded_bytes(
 
     if !collect_hits {
         if linux_dominant_file.eligible {
-            if let Some((fast_count, shard_plan)) = maybe_linux_dominant_file_fast_count_bytes(
-                plan,
-                bytes,
-                concurrency,
-                outer_scan_threads,
-            ) {
+            if let Some((fast_count, shard_plan, shard_kernel)) =
+                maybe_linux_dominant_file_fast_count_bytes(
+                    plan,
+                    bytes,
+                    concurrency,
+                    outer_scan_threads,
+                )
+            {
                 match_count = fast_count.count;
                 unicode_casefold_prefilter = fast_count.unicode_casefold_prefilter;
                 fast_count_density = fast_count.fast_count_density;
+                byte_shard_kernel = shard_kernel;
                 linux_dominant_file.activated = true;
                 linux_dominant_file.shard_threads = shard_plan.shard_threads;
                 linux_dominant_file.range_count = shard_plan.range_count;
@@ -1520,6 +1558,8 @@ fn scan_loaded_bytes(
                     regex_decomposition,
                     unicode_casefold_prefilter,
                     fast_count_density,
+                    byte_shard_kernel,
+                    fallback_line_scan,
                     Some(shard_plan),
                     linux_dominant_file,
                 );
@@ -1530,12 +1570,13 @@ fn scan_loaded_bytes(
             && plan.uses_single_literal_counter()
             && is_linux_dominant_file_target(path, file_bytes);
         if !skip_parallel_fast_count {
-            if let Some((fast_count, shard_plan)) =
+            if let Some((fast_count, shard_plan, shard_kernel)) =
                 maybe_parallel_fast_count_bytes(plan, bytes, concurrency, outer_scan_threads)
             {
                 match_count = fast_count.count;
                 unicode_casefold_prefilter = fast_count.unicode_casefold_prefilter;
                 fast_count_density = fast_count.fast_count_density;
+                byte_shard_kernel = shard_kernel;
                 return completed_outcome(
                     path,
                     path_index,
@@ -1547,6 +1588,8 @@ fn scan_loaded_bytes(
                     regex_decomposition,
                     unicode_casefold_prefilter,
                     fast_count_density,
+                    byte_shard_kernel,
+                    fallback_line_scan,
                     Some(shard_plan),
                     linux_dominant_file,
                 );
@@ -1580,6 +1623,8 @@ fn scan_loaded_bytes(
                     regex_decomposition,
                     unicode_casefold_prefilter,
                     fast_count_density,
+                    byte_shard_kernel,
+                    fallback_line_scan,
                     shard_plan,
                     linux_dominant_file,
                 );
@@ -1590,10 +1635,20 @@ fn scan_loaded_bytes(
             }
             None => {}
         }
-        if let Some(fast_count) = plan.fast_match_count_no_hits_bytes_with_stats(bytes) {
+        let fast_count_result = if fallback_line_profile {
+            count_fast_match_bytes_with_profile(plan, path, bytes, file_bytes)
+                .map(|profiled| (profiled.outcome, Some(Box::new(profiled.telemetry))))
+        } else {
+            plan.fast_match_count_no_hits_bytes_with_stats(bytes)
+                .map(|outcome| (outcome, None))
+        };
+        if let Some((fast_count, telemetry)) = fast_count_result {
             match_count = fast_count.count;
             unicode_casefold_prefilter = fast_count.unicode_casefold_prefilter;
             fast_count_density = fast_count.fast_count_density;
+            if telemetry.is_some() {
+                fallback_line_scan = telemetry;
+            }
             return completed_outcome(
                 path,
                 path_index,
@@ -1605,6 +1660,8 @@ fn scan_loaded_bytes(
                 regex_decomposition,
                 unicode_casefold_prefilter,
                 fast_count_density,
+                byte_shard_kernel,
+                fallback_line_scan,
                 None,
                 linux_dominant_file,
             );
@@ -1612,40 +1669,46 @@ fn scan_loaded_bytes(
     }
 
     if plan.supports_byte_mode() {
-        let mut line_start = 0usize;
-        let mut line_no = 0usize;
+        if fallback_line_profile {
+            let profiled = count_fallback_byte_lines_with_profile(plan, path, bytes, file_bytes);
+            match_count = profiled.match_count;
+            fallback_line_scan = Some(Box::new(profiled.telemetry));
+        } else {
+            let mut line_start = 0usize;
+            let mut line_no = 0usize;
 
-        loop {
-            if line_start == bytes.len() {
-                break;
-            }
-
-            let line_end = match memchr(b'\n', &bytes[line_start..]) {
-                Some(offset) => line_start + offset,
-                None => bytes.len(),
-            };
-
-            let raw_line = &bytes[line_start..line_end];
-            let line = trim_trailing_cr(raw_line);
-            line_no += 1;
-            if plan.matches_bytes(line) {
-                match_count += 1;
-                if should_retain_hit(collect_hits, hits.len(), hit_limit) {
-                    hits.push(SearchHit {
-                        path: cached_path
-                            .get_or_insert_with(|| path.display().to_string())
-                            .clone(),
-                        line: line_no,
-                        column: plan.first_match_column_bytes(line).unwrap_or(1),
-                        preview: String::from_utf8_lossy(line).chars().take(220).collect(),
-                    });
+            loop {
+                if line_start == bytes.len() {
+                    break;
                 }
-            }
 
-            if line_end == bytes.len() {
-                break;
+                let line_end = match memchr(b'\n', &bytes[line_start..]) {
+                    Some(offset) => line_start + offset,
+                    None => bytes.len(),
+                };
+
+                let raw_line = &bytes[line_start..line_end];
+                let line = trim_trailing_cr(raw_line);
+                line_no += 1;
+                if plan.matches_bytes(line) {
+                    match_count += 1;
+                    if should_retain_hit(collect_hits, hits.len(), hit_limit) {
+                        hits.push(SearchHit {
+                            path: cached_path
+                                .get_or_insert_with(|| path.display().to_string())
+                                .clone(),
+                            line: line_no,
+                            column: plan.first_match_column_bytes(line).unwrap_or(1),
+                            preview: String::from_utf8_lossy(line).chars().take(220).collect(),
+                        });
+                    }
+                }
+
+                if line_end == bytes.len() {
+                    break;
+                }
+                line_start = line_end + 1;
             }
-            line_start = line_end + 1;
         }
     } else {
         let text = String::from_utf8_lossy(bytes);
@@ -1663,6 +1726,8 @@ fn scan_loaded_bytes(
                     regex_decomposition,
                     unicode_casefold_prefilter,
                     fast_count_density,
+                    byte_shard_kernel,
+                    fallback_line_scan,
                     None,
                     linux_dominant_file,
                 );
@@ -1698,9 +1763,133 @@ fn scan_loaded_bytes(
         regex_decomposition,
         unicode_casefold_prefilter,
         fast_count_density,
+        byte_shard_kernel,
+        fallback_line_scan,
         None,
         linux_dominant_file,
     )
+}
+
+#[derive(Debug)]
+struct FallbackLineProfileResult {
+    match_count: usize,
+    telemetry: FallbackLineScanStats,
+}
+
+#[derive(Debug)]
+struct FallbackFastCountProfileResult {
+    outcome: FastCountOutcome,
+    telemetry: FallbackLineScanStats,
+}
+
+fn count_fast_match_bytes_with_profile(
+    plan: &ExpressionPlan,
+    path: &Path,
+    bytes: &[u8],
+    file_bytes: u64,
+) -> Option<FallbackFastCountProfileResult> {
+    let mut telemetry = FallbackLineScanStats {
+        enabled: true,
+        files_profiled: 1,
+        scanned_line_bytes: bytes.len(),
+        max_file_bytes: file_bytes,
+        max_file_path: path.display().to_string(),
+        ..FallbackLineScanStats::default()
+    };
+
+    let newline_started = Instant::now();
+    let mut line_start = 0usize;
+    loop {
+        if line_start == bytes.len() {
+            break;
+        }
+
+        let line_end = match memchr(b'\n', &bytes[line_start..]) {
+            Some(offset) => line_start + offset,
+            None => bytes.len(),
+        };
+        let line = trim_trailing_cr(&bytes[line_start..line_end]);
+        telemetry.line_count += 1;
+        telemetry.max_line_bytes = telemetry.max_line_bytes.max(line.len());
+
+        if line_end == bytes.len() {
+            break;
+        }
+        line_start = line_end + 1;
+    }
+    telemetry.newline_elapsed_ns_total = duration_ns_u64(newline_started.elapsed());
+
+    let regex_started = Instant::now();
+    let outcome = plan.fast_match_count_no_hits_bytes_with_stats(bytes)?;
+    telemetry.regex_elapsed_ns_total = duration_ns_u64(regex_started.elapsed());
+    telemetry.candidate_lines = telemetry.line_count;
+    telemetry.matched_lines = outcome.count;
+    telemetry.max_file_elapsed_ns =
+        telemetry.newline_elapsed_ns_total + telemetry.regex_elapsed_ns_total;
+    telemetry.max_file_lines = telemetry.line_count;
+    telemetry.max_file_matches = outcome.count;
+
+    Some(FallbackFastCountProfileResult { outcome, telemetry })
+}
+
+fn count_fallback_byte_lines_with_profile(
+    plan: &ExpressionPlan,
+    path: &Path,
+    bytes: &[u8],
+    file_bytes: u64,
+) -> FallbackLineProfileResult {
+    let file_started = Instant::now();
+    let mut line_start = 0usize;
+    let mut match_count = 0usize;
+    let mut telemetry = FallbackLineScanStats {
+        enabled: true,
+        files_profiled: 1,
+        max_file_bytes: file_bytes,
+        max_file_path: path.display().to_string(),
+        ..FallbackLineScanStats::default()
+    };
+
+    loop {
+        if line_start == bytes.len() {
+            break;
+        }
+
+        let newline_started = Instant::now();
+        let line_end = match memchr(b'\n', &bytes[line_start..]) {
+            Some(offset) => line_start + offset,
+            None => bytes.len(),
+        };
+        telemetry.newline_elapsed_ns_total += duration_ns_u64(newline_started.elapsed());
+
+        let raw_line = &bytes[line_start..line_end];
+        let line = trim_trailing_cr(raw_line);
+        telemetry.line_count += 1;
+        telemetry.candidate_lines += 1;
+        telemetry.scanned_line_bytes += line.len();
+        telemetry.max_line_bytes = telemetry.max_line_bytes.max(line.len());
+
+        let regex_started = Instant::now();
+        let matched = plan.matches_bytes(line);
+        telemetry.regex_elapsed_ns_total += duration_ns_u64(regex_started.elapsed());
+        if matched {
+            match_count += 1;
+            telemetry.matched_lines += 1;
+        }
+
+        if line_end == bytes.len() {
+            break;
+        }
+        line_start = line_end + 1;
+    }
+
+    telemetry.max_file_elapsed_ns = duration_ns_u64(file_started.elapsed());
+    telemetry.max_file_lines = telemetry.line_count;
+    telemetry.max_file_matches = match_count;
+
+    FallbackLineProfileResult {
+        match_count,
+        telemetry,
+    }
 }
 
 fn should_retain_hit(collect_hits: bool, retained_hits: usize, hit_limit: Option<usize>) -> bool {
@@ -1721,7 +1910,7 @@ fn maybe_parallel_fast_count_bytes(
     bytes: &[u8],
     concurrency: ConcurrencyPlanner,
     outer_scan_threads: usize,
-) -> Option<(FastCountOutcome, ParallelShardPlan)> {
+) -> Option<(FastCountOutcome, ParallelShardPlan, ByteShardKernelStats)> {
     if outer_scan_threads > 1 && !plan.supports_outer_parallel_shard_fast_count() {
         return None;
     }
@@ -1735,61 +1924,15 @@ fn maybe_parallel_fast_count_bytes(
         .num_threads(shard_plan.shard_threads)
         .build()
         .ok()?;
+    let profile_kernel = byte_shard_kernel_profile_enabled();
     pool.install(|| {
         ranges
             .par_iter()
             .map(|(start, end)| {
-                plan.fast_match_count_no_hits_bytes_in_range_with_stats(bytes, *start, *end)
+                count_fast_range_with_optional_profile(plan, bytes, *start, *end, profile_kernel)
             })
             .collect::<Option<Vec<_>>>()
-            .map(|counts| {
-                let mut merged = FastCountOutcome::default();
-                for count in counts {
-                    merged.count += count.count;
-                    merged.fast_count_density.literal_range_calls +=
-                        count.fast_count_density.literal_range_calls;
-                    merged.fast_count_density.literal_range_bytes +=
-                        count.fast_count_density.literal_range_bytes;
-                    merged.fast_count_density.literal_matches +=
-                        count.fast_count_density.literal_matches;
-                    merged.fast_count_density.alternate_range_calls +=
-                        count.fast_count_density.alternate_range_calls;
-                    merged.fast_count_density.alternate_range_bytes +=
-                        count.fast_count_density.alternate_range_bytes;
-                    merged.fast_count_density.alternate_matches +=
-                        count.fast_count_density.alternate_matches;
-                    merged.unicode_casefold_prefilter = {
-                        let mut telemetry = merged.unicode_casefold_prefilter;
-                        telemetry.full_scan_calls +=
-                            count.unicode_casefold_prefilter.full_scan_calls;
-                        telemetry.range_scan_calls +=
-                            count.unicode_casefold_prefilter.range_scan_calls;
-                        telemetry.candidate_prefix_hits +=
-                            count.unicode_casefold_prefilter.candidate_prefix_hits;
-                        telemetry.candidate_windows_verified +=
-                            count.unicode_casefold_prefilter.candidate_windows_verified;
-                        telemetry.confirmed_matches +=
-                            count.unicode_casefold_prefilter.confirmed_matches;
-                        telemetry.rejected_candidates +=
-                            count.unicode_casefold_prefilter.rejected_candidates;
-                        telemetry.candidate_gap_bytes_total +=
-                            count.unicode_casefold_prefilter.candidate_gap_bytes_total;
-                        telemetry.candidate_gap_samples +=
-                            count.unicode_casefold_prefilter.candidate_gap_samples;
-                        telemetry.max_prefix_variant_count = telemetry
-                            .max_prefix_variant_count
-                            .max(count.unicode_casefold_prefilter.max_prefix_variant_count);
-                        telemetry.max_prefix_len = telemetry
-                            .max_prefix_len
-                            .max(count.unicode_casefold_prefilter.max_prefix_len);
-                        telemetry.max_match_len = telemetry
-                            .max_match_len
-                            .max(count.unicode_casefold_prefilter.max_match_len);
-                        telemetry
-                    };
-                }
-                (merged, shard_plan)
-            })
+            .map(|counts| merge_shard_range_counts(counts, shard_plan, profile_kernel))
     })
 }
 
@@ -1807,6 +1950,159 @@ fn maybe_parallel_regex_decomposition_count_bytes(
     let ranges = build_chunk_ranges(bytes.len(), shard_plan.chunk_bytes);
     plan.fast_decomposition_count_no_hits_bytes_sharded(bytes, &ranges)
         .map(|result| (result, shard_plan))
+}
+
+fn byte_shard_kernel_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("IX_BYTE_SHARD_KERNEL_PROFILE")
+            .and_then(|value| value.into_string().ok())
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn fallback_line_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("IX_FALLBACK_LINE_PROFILE")
+            .and_then(|value| value.into_string().ok())
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn count_fast_range_with_optional_profile(
+    plan: &ExpressionPlan,
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    profile_kernel: bool,
+) -> Option<ShardRangeCount> {
+    if !profile_kernel {
+        return plan
+            .fast_match_count_no_hits_bytes_in_range_with_stats(bytes, start, end)
+            .map(|outcome| ShardRangeCount {
+                outcome,
+                kernel: ByteShardKernelStats::default(),
+            });
+    }
+
+    let overlap = plan.fast_match_count_range_overlap().unwrap_or(0);
+    let logical_range_bytes = end.saturating_sub(start.min(end));
+    let slice_start = start.saturating_sub(overlap);
+    let slice_end = bytes.len().min(end.saturating_add(overlap));
+    let widened_range_bytes = slice_end.saturating_sub(slice_start);
+    let started = Instant::now();
+    let outcome = plan.fast_match_count_no_hits_bytes_in_range_with_stats(bytes, start, end)?;
+    let elapsed_ns = duration_ns_u64(started.elapsed());
+
+    Some(ShardRangeCount {
+        kernel: ByteShardKernelStats {
+            enabled: true,
+            range_calls: 1,
+            logical_range_bytes,
+            widened_range_bytes,
+            overlap_bytes: widened_range_bytes.saturating_sub(logical_range_bytes),
+            range_elapsed_ns_total: elapsed_ns,
+            max_range_elapsed_ns: elapsed_ns,
+            matches: outcome.count,
+            ..ByteShardKernelStats::default()
+        },
+        outcome,
+    })
+}
+
+fn merge_shard_range_counts(
+    counts: Vec<ShardRangeCount>,
+    shard_plan: ParallelShardPlan,
+    profile_kernel: bool,
+) -> (FastCountOutcome, ParallelShardPlan, ByteShardKernelStats) {
+    let reduce_started = profile_kernel.then(Instant::now);
+    let mut merged = FastCountOutcome::default();
+    let mut kernel = ByteShardKernelStats {
+        enabled: profile_kernel,
+        files_profiled: usize::from(profile_kernel),
+        ..ByteShardKernelStats::default()
+    };
+
+    for count in counts {
+        merged.count += count.outcome.count;
+        merged.fast_count_density.literal_range_calls +=
+            count.outcome.fast_count_density.literal_range_calls;
+        merged.fast_count_density.literal_range_bytes +=
+            count.outcome.fast_count_density.literal_range_bytes;
+        merged.fast_count_density.literal_matches +=
+            count.outcome.fast_count_density.literal_matches;
+        merged.fast_count_density.alternate_range_calls +=
+            count.outcome.fast_count_density.alternate_range_calls;
+        merged.fast_count_density.alternate_range_bytes +=
+            count.outcome.fast_count_density.alternate_range_bytes;
+        merged.fast_count_density.alternate_matches +=
+            count.outcome.fast_count_density.alternate_matches;
+        merged.unicode_casefold_prefilter = merge_unicode_casefold_prefilter_stats(
+            merged.unicode_casefold_prefilter,
+            count.outcome,
+        );
+
+        kernel.range_calls += count.kernel.range_calls;
+        kernel.logical_range_bytes += count.kernel.logical_range_bytes;
+        kernel.widened_range_bytes += count.kernel.widened_range_bytes;
+        kernel.overlap_bytes += count.kernel.overlap_bytes;
+        kernel.range_elapsed_ns_total += count.kernel.range_elapsed_ns_total;
+        kernel.max_range_elapsed_ns = kernel
+            .max_range_elapsed_ns
+            .max(count.kernel.max_range_elapsed_ns);
+        kernel.matches += count.kernel.matches;
+    }
+
+    if let Some(started) = reduce_started {
+        let elapsed_ns = duration_ns_u64(started.elapsed());
+        kernel.reduce_elapsed_ns_total = elapsed_ns;
+        kernel.max_reduce_elapsed_ns = elapsed_ns;
+    }
+
+    (merged, shard_plan, kernel)
+}
+
+fn merge_unicode_casefold_prefilter_stats(
+    mut telemetry: UnicodeCaseFoldPrefilterStats,
+    count: FastCountOutcome,
+) -> UnicodeCaseFoldPrefilterStats {
+    telemetry.full_scan_calls += count.unicode_casefold_prefilter.full_scan_calls;
+    telemetry.range_scan_calls += count.unicode_casefold_prefilter.range_scan_calls;
+    telemetry.candidate_prefix_hits += count.unicode_casefold_prefilter.candidate_prefix_hits;
+    telemetry.candidate_windows_verified +=
+        count.unicode_casefold_prefilter.candidate_windows_verified;
+    telemetry.confirmed_matches += count.unicode_casefold_prefilter.confirmed_matches;
+    telemetry.rejected_candidates += count.unicode_casefold_prefilter.rejected_candidates;
+    telemetry.candidate_gap_bytes_total +=
+        count.unicode_casefold_prefilter.candidate_gap_bytes_total;
+    telemetry.candidate_gap_samples += count.unicode_casefold_prefilter.candidate_gap_samples;
+    telemetry.max_prefix_variant_count = telemetry
+        .max_prefix_variant_count
+        .max(count.unicode_casefold_prefilter.max_prefix_variant_count);
+    telemetry.max_prefix_len = telemetry
+        .max_prefix_len
+        .max(count.unicode_casefold_prefilter.max_prefix_len);
+    telemetry.max_match_len = telemetry
+        .max_match_len
+        .max(count.unicode_casefold_prefilter.max_match_len);
+    telemetry
+}
+
+fn duration_ns_u64(duration: std::time::Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
 }
 
 fn regex_decomposition_parallel_plan_with_available(
@@ -1838,7 +2134,7 @@ fn linux_dominant_file_fast_count_with_available(
     bytes: &[u8],
     outer_scan_threads: usize,
     available: usize,
-) -> Option<(FastCountOutcome, ParallelShardPlan)> {
+) -> Option<(FastCountOutcome, ParallelShardPlan, ByteShardKernelStats)> {
     if !plan.supports_parallel_fast_count_ranges() {
         return None;
     }
@@ -1853,61 +2149,15 @@ fn linux_dominant_file_fast_count_with_available(
         .num_threads(shard_plan.shard_threads)
         .build()
         .ok()?;
+    let profile_kernel = byte_shard_kernel_profile_enabled();
     pool.install(|| {
         ranges
             .par_iter()
             .map(|(start, end)| {
-                plan.fast_match_count_no_hits_bytes_in_range_with_stats(bytes, *start, *end)
+                count_fast_range_with_optional_profile(plan, bytes, *start, *end, profile_kernel)
             })
             .collect::<Option<Vec<_>>>()
-            .map(|counts| {
-                let mut merged = FastCountOutcome::default();
-                for count in counts {
-                    merged.count += count.count;
-                    merged.fast_count_density.literal_range_calls +=
-                        count.fast_count_density.literal_range_calls;
-                    merged.fast_count_density.literal_range_bytes +=
-                        count.fast_count_density.literal_range_bytes;
-                    merged.fast_count_density.literal_matches +=
-                        count.fast_count_density.literal_matches;
-                    merged.fast_count_density.alternate_range_calls +=
-                        count.fast_count_density.alternate_range_calls;
-                    merged.fast_count_density.alternate_range_bytes +=
-                        count.fast_count_density.alternate_range_bytes;
-                    merged.fast_count_density.alternate_matches +=
-                        count.fast_count_density.alternate_matches;
-                    merged.unicode_casefold_prefilter = {
-                        let mut telemetry = merged.unicode_casefold_prefilter;
-                        telemetry.full_scan_calls +=
-                            count.unicode_casefold_prefilter.full_scan_calls;
-                        telemetry.range_scan_calls +=
-                            count.unicode_casefold_prefilter.range_scan_calls;
-                        telemetry.candidate_prefix_hits +=
-                            count.unicode_casefold_prefilter.candidate_prefix_hits;
-                        telemetry.candidate_windows_verified +=
-                            count.unicode_casefold_prefilter.candidate_windows_verified;
-                        telemetry.confirmed_matches +=
-                            count.unicode_casefold_prefilter.confirmed_matches;
-                        telemetry.rejected_candidates +=
-                            count.unicode_casefold_prefilter.rejected_candidates;
-                        telemetry.candidate_gap_bytes_total +=
-                            count.unicode_casefold_prefilter.candidate_gap_bytes_total;
-                        telemetry.candidate_gap_samples +=
-                            count.unicode_casefold_prefilter.candidate_gap_samples;
-                        telemetry.max_prefix_variant_count = telemetry
-                            .max_prefix_variant_count
-                            .max(count.unicode_casefold_prefilter.max_prefix_variant_count);
-                        telemetry.max_prefix_len = telemetry
-                            .max_prefix_len
-                            .max(count.unicode_casefold_prefilter.max_prefix_len);
-                        telemetry.max_match_len = telemetry
-                            .max_match_len
-                            .max(count.unicode_casefold_prefilter.max_match_len);
-                        telemetry
-                    };
-                }
-                (merged, shard_plan)
-            })
+            .map(|counts| merge_shard_range_counts(counts, shard_plan, profile_kernel))
     })
 }
 
@@ -1916,7 +2166,7 @@ fn maybe_linux_dominant_file_fast_count_bytes(
     bytes: &[u8],
     concurrency: ConcurrencyPlanner,
     outer_scan_threads: usize,
-) -> Option<(FastCountOutcome, ParallelShardPlan)> {
+) -> Option<(FastCountOutcome, ParallelShardPlan, ByteShardKernelStats)> {
     linux_dominant_file_fast_count_with_available(
         plan,
         bytes,
@@ -2110,6 +2360,8 @@ fn completed_outcome(
     regex_decomposition: RegexDecompositionStats,
     unicode_casefold_prefilter: UnicodeCaseFoldPrefilterStats,
     fast_count_density: FastCountDensityStats,
+    byte_shard_kernel: ByteShardKernelStats,
+    fallback_line_scan: Option<Box<FallbackLineScanStats>>,
     shard_plan: Option<ParallelShardPlan>,
     linux_dominant_file: LinuxDominantFileExecution,
 ) -> FileScanOutcome {
@@ -2124,6 +2376,8 @@ fn completed_outcome(
         regex_decomposition,
         unicode_casefold_prefilter,
         fast_count_density,
+        byte_shard_kernel,
+        fallback_line_scan,
         scanned: true,
         shard_plan,
         linux_dominant_target: is_linux_dominant_file_target(path, bytes),
@@ -2148,6 +2402,8 @@ fn failed_outcome(
         regex_decomposition: RegexDecompositionStats::default(),
         unicode_casefold_prefilter: UnicodeCaseFoldPrefilterStats::default(),
         fast_count_density: FastCountDensityStats::default(),
+        byte_shard_kernel: ByteShardKernelStats::default(),
+        fallback_line_scan: None,
         scanned: false,
         shard_plan: None,
         linux_dominant_target: false,
@@ -2911,6 +3167,7 @@ mod tests {
                 available_threads: 32,
             },
             1,
+            false,
             &bytes,
             bytes.len() as u64,
         );
@@ -2961,6 +3218,7 @@ mod tests {
                 available_threads: 32,
             },
             1,
+            false,
             &bytes,
             bytes.len() as u64,
         );

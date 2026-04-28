@@ -1,6 +1,6 @@
 <div align="center">
 
-# iEx
+# IX
 
 **Rust search CLI and benchmark platform with workload-aware execution and proof-first performance governance.**
 
@@ -20,7 +20,7 @@
 
 ---
 
-iEx v2 is a Rust-first search engine plus benchmark harness. The current core routes work between materialized scan, `--stats-only` streaming dispatch, and shard-safe large-file fast count for eligible lanes. Regex execution stays inside the Rust `regex` / `regex::bytes` stack, with planner-owned fast paths for literal-equivalent shapes and a decomposed candidate path for eligible stats-only regex workloads.
+IX v2 is a Rust-first search engine plus benchmark harness. The current core routes work between materialized scan, `--stats-only` streaming dispatch, and shard-safe large-file fast count for eligible lanes. Regex execution stays inside the Rust `regex` / `regex::bytes` stack, with planner-owned fast paths for literal-equivalent shapes and a decomposed candidate path for eligible stats-only regex workloads.
 
 The repo target is explicit: beat ripgrep on transparent benchmark suites. The operator contract is just as important as the matcher contract: `bench:report` is the raw external provenance surface, `bench:loop` is the live diagnostics feed, and every promotion must beat an immutable current binary snapshot before the loop moves.
 
@@ -52,7 +52,7 @@ ix explain "lit:breach && lit:auth"
 
 ## rg-style ingress compatibility
 
-`ix search` and `ix explain` are the canonical command surface for the iEx engine. The Cargo package remains `iex-cli`; the operator-facing binary is `ix` so shell usage stays short and avoids PowerShell's built-in `iex` alias. For agent-friendly local search, iEx also accepts a narrow ripgrep-shaped ingress layer and lowers it into the same native search path.
+`ix search` and `ix explain` are the canonical command surface for the IX engine. The Cargo package remains `iex-cli`; the operator-facing binary is `ix` so shell usage stays short and avoids PowerShell's built-in `iex` alias. For agent-friendly local search, IX also accepts a narrow ripgrep-shaped ingress layer and lowers it into the same native search path.
 
 - `ix PATTERN [PATH]...`
 - `ix -e PATTERN [PATH]...`
@@ -63,7 +63,7 @@ ix explain "lit:breach && lit:auth"
 - `ix --json`
 - `ix --hidden`
 
-If a request falls outside that subset, iEx returns a guided non-zero error instead of trying to emulate full ripgrep behavior.
+If a request falls outside that subset, IX returns a guided non-zero error instead of trying to emulate full ripgrep behavior.
 
 ---
 
@@ -86,7 +86,7 @@ An explicit predicate syntax with native boolean composition. The expression pla
 
 ## Benchmark governance
 
-iEx keeps three benchmark surfaces aligned:
+IX keeps three benchmark surfaces aligned:
 
 - canonical external raw baseline: `npm run bench:report` -> `tools/reports/bench/ripgrep-benchsuite-*.csv`
 - live operator diagnostics: `npm run bench:loop` -> `tools/reports/live-metrics.jsonl`
@@ -133,7 +133,7 @@ npm run bench:once -- --expression "re:\\w+\\s+Holmes\\s+\\w+" --corpus ".refs/r
 <details>
 <summary><strong>Execution mode selection</strong></summary>
 
-iEx routes each workload through one of three execution modes based on live corpus telemetry. Mode selection is automatic and requires no configuration.
+IX routes each workload through one of three execution modes based on live corpus telemetry. Mode selection is automatic and requires no configuration.
 
 ```mermaid
 flowchart TD
@@ -243,7 +243,7 @@ The decomposition path is intentionally narrower than a generic regex prefilter 
 
 `RegexDecomposition` uses byte sharding as a bounded literal-discovery accelerator, not as arbitrary parallel regex execution. The planner first proves a required literal anchor, then shards only the full-buffer anchor walk. Each shard owns candidate literal starts inside its byte interval and reads a right-extended window so boundary-crossing anchors remain visible without transferring ownership to the neighboring shard. Context gates evaluate against the full haystack, never a truncated shard slice.
 
-After shard-local discovery, iEx merges candidate line starts globally with `sort_unstable` plus `dedup`. Full `regex::bytes` confirmation runs once per unique candidate line, preserving serial match-count semantics while avoiding duplicate confirmations when multiple anchors land on one line or a candidate line crosses a shard seam. The current activation gate is intentionally small: stats-only regex decomposition, one outer scan thread, file length at least `64 MiB`, and at most two shard workers.
+After shard-local discovery, IX merges candidate line starts globally with `sort_unstable` plus `dedup`. Full `regex::bytes` confirmation runs once per unique candidate line, preserving serial match-count semantics while avoiding duplicate confirmations when multiple anchors land on one line or a candidate line crosses a shard seam. The current activation gate is intentionally small: stats-only regex decomposition, one outer scan thread, file length at least `64 MiB`, and at most two shard workers.
 
 | Phase | Byte-sharding invariant |
 | --- | --- |
@@ -260,7 +260,7 @@ This shifts the hot work from one serial full-buffer anchor pass into owned byte
 <details>
 <summary><strong>Shard geometry</strong></summary>
 
-File-level parallelism is structurally insufficient when a single file dominates corpus byte volume. iEx shards inward: the file is partitioned into disjoint owned byte ranges, each processed by a dedicated Rayon worker.
+File-level parallelism is structurally insufficient when a single file dominates corpus byte volume. IX shards inward: the file is partitioned into disjoint owned byte ranges, each processed by a dedicated Rayon worker.
 
 Shard geometry is solved before any worker starts. Thread budget, chunk sizing, and range count are co-determined to keep workers fed without generating scheduler overhead on underfeedable shard counts. The planner enforces a minimum chunk floor by file regime (16 MB for medium-large, 64 MB for dominant giant files) and caps worker count at the number of ranges the file can actually sustain.
 
@@ -402,7 +402,7 @@ cargo build --release -p iex-cli
 | `tools/reports/` | Benchmark outputs and differentials |
 | `dashboard/` | Live benchmark loop |
 | `.refs/` | Pinned competitor and corpus reference clones |
-| `.docs/iex-v2-crown-jewel.md` | Architecture decisions and benchmark doctrine |
+| `.docs/iex-v2-crown-jewel.md` | IX architecture decisions and benchmark doctrine |
 
 **Read next:**
 - `crates/iex-core/src/engine.rs` -- scan engine, concurrency planner, shard geometry
