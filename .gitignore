@@ -6,6 +6,7 @@
 .DS_Store
 Thumbs.db
 /.docs
+/.harness
 /tests
 /todo
 /tools

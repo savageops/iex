@@ -42,6 +42,13 @@ ix search "lit:error && re:\btimeout\b" . --json
 # Count-only mode, maximum throughput, no hit payload
 ix search "re:CVE-\d{4}-\d{4,6}" . --stats-only --json
 
+# Hit records only, same search engine as `ix search`
+ix matches "lit:SearchConfig" crates
+
+# Native file windows and match context for agent code-reading
+ix inspect crates/iex-cli/src/main.rs --range 40:80
+ix inspect --expr "lit:SearchConfig" crates --context 2 --json
+
 # Inspect the execution path a predicate compiles to
 ix explain "lit:breach && lit:auth"
 ```
@@ -52,7 +59,7 @@ ix explain "lit:breach && lit:auth"
 
 ## rg-style ingress compatibility
 
-`ix search` and `ix explain` are the canonical command surface for the IX engine. The Cargo package remains `iex-cli`; the operator-facing binary is `ix` so shell usage stays short and avoids PowerShell's built-in `iex` alias. For agent-friendly local search, IX also accepts a narrow ripgrep-shaped ingress layer and lowers it into the same native search path.
+`ix search`, `ix matches`, `ix inspect`, and `ix explain` are the canonical command surface for the IX engine. The Cargo package remains `iex-cli`; the operator-facing binary is `ix` so shell usage stays short and avoids PowerShell's built-in `iex` alias. For agent-friendly local search, IX also accepts a narrow ripgrep-shaped ingress layer and lowers it into the same native search path.
 
 - `ix PATTERN [PATH]...`
 - `ix -e PATTERN [PATH]...`
@@ -64,6 +71,24 @@ ix explain "lit:breach && lit:auth"
 - `ix --hidden`
 
 If a request falls outside that subset, IX returns a guided non-zero error instead of trying to emulate full ripgrep behavior.
+
+---
+
+## Developer inspection
+
+`ix inspect` replaces common shell-specific code-reading fragments with native Rust contracts:
+
+| Workflow | IX command |
+|---|---|
+| First N lines | `ix inspect file --total-count 40` |
+| Skip then take | `ix inspect file --skip 120 --limit 30` |
+| Sed-style print range | `ix inspect file --range 40:80` |
+| Match context | `ix inspect --expr "lit:SearchConfig" crates --context 2` |
+| Structured excerpts | `ix inspect --expr "re:TODO|FIXME" crates --context 1 --json` |
+
+Inspection is read-only. Mutation, replacement, and in-place write behavior belong to a future transform command, not to `inspect`.
+
+Detailed schema and ownership notes: [docs/developer-inspection-command-surface.md](docs/developer-inspection-command-surface.md)
 
 ---
 
@@ -396,8 +421,9 @@ cargo build --release -p iex-cli
 | Path | Concern |
 |---|---|
 | `crates/iex-core` | Planner, scan kernel, shard geometry, telemetry |
-| `crates/iex-cli` | CLI surface (`search`, `explain`) |
+| `crates/iex-cli` | CLI surface (`search`, `matches`, `inspect`, `explain`) |
 | `crates/iex-bench` | Benchmark instrumentation |
+| `docs/` | Public operator documentation |
 | `tests/materialized` | Contract and tooling tests |
 | `tools/reports/` | Benchmark outputs and differentials |
 | `dashboard/` | Live benchmark loop |
