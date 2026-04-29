@@ -2,16 +2,12 @@
 
 # Intelligent {Expressions}
 
-**Rust search CLI and benchmark platform with workload-aware execution and proof-first performance governance.**
-
-*Routes literal and regex searches through the cheapest exact path it can prove, then measures every performance slice against immutable baselines before promotion.*
-
----
+**A Rust search engine for local-first retrieval workloads, built around byte-range sharding and a planner that compiles every query to the narrowest exact execution path.**
 
 [![CI](https://github.com/savageops/iEx/actions/workflows/build-native-binaries.yml/badge.svg)](https://github.com/savageops/iEx/actions/workflows/build-native-binaries.yml)
 [![Release](https://img.shields.io/github/v/release/savageops/iEx?display_name=tag&sort=semver&label=Release)](https://github.com/savageops/iEx/releases/latest)
 [![Docs](https://img.shields.io/badge/Docs-iex.run-111111)](https://iex.run)
-[![Rust](https://img.shields.io/badge/Built%20in-Rust-orange?logo=rust)](https://www.rust-lang.org/)
+[![Built in Rust](https://img.shields.io/badge/Built%20in-Rust-orange?logo=rust)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-0f766e)](./LICENSE)
 
 [Site](https://iex.run) · [Releases](https://github.com/savageops/iEx/releases/latest) · [Docs](https://iex.run/docs)
@@ -20,9 +16,16 @@
 
 ---
 
-IX v2 is a Rust-first search engine plus benchmark harness. The current core routes work between materialized scan, `--stats-only` streaming dispatch, and shard-safe large-file fast count for eligible lanes. Regex execution stays inside the Rust `regex` / `regex::bytes` stack, with planner-owned fast paths for literal-equivalent shapes and a decomposed candidate path for eligible stats-only regex workloads.
+## Overview
 
-The repo target is explicit: beat ripgrep on transparent benchmark suites. The operator contract is just as important as the matcher contract: `bench:report` is the raw external provenance surface, `bench:loop` is the live diagnostics feed, and every promotion must beat an immutable current binary snapshot before the loop moves.
+iex is a Rust-first search engine designed for the workload class that dominates local agentic systems: a single machine reading a single corpus on behalf of a model that has zero patience and limited context. The engine targets two structural problems that conventional file-level parallel search engines do not solve:
+
+1. **Tail dominance.** When one file holds the majority of corpus byte volume, file-level parallelism collapses to single-threaded execution.
+2. **Plan opacity.** Most engines return a regex and a result; they do not expose the execution machine the query was lowered to, or the cost terms the planner used to choose it.
+
+iex addresses the first through byte-range sharding inside a single file, and the second through a planner-first architecture in which every query produces a structured execution plan that can be inspected, measured, and reasoned about by the calling agent.
+
+The repository's stated performance target is to beat ripgrep on transparent benchmark suites. Promotion of the canonical binary requires that a candidate beat an immutable snapshot of the current binary on the exact suite under interleaved measurement, and the suite itself is the official ripgrep benchsuite. The benchmark contract is documented in [`tools/reports/`](tools/reports/) and is not optional.
 
 ---
 
@@ -31,292 +34,111 @@ The repo target is explicit: beat ripgrep on transparent benchmark suites. The o
 ```sh
 cargo install iex-cli
 
-# Agent-friendly rg-style ingress for simple searches
+# rg-style ingress for simple queries
 ix timeout .
 ix -F -i "session timeout" .
 ix -e timeout -e error .
 
-# Structured JSON output
+# Native predicate language with structured output
 ix search "lit:error && re:\btimeout\b" . --json
 
-# Count-only mode, maximum throughput, no hit payload
+# Count-only mode (no hit payload)
 ix search "re:CVE-\d{4}-\d{4,6}" . --stats-only --json
 
-# Hit records only, same search engine as `ix search`
+# Hit records only — same engine, narrower contract
 ix matches "lit:SearchConfig" crates
 
-# Native file windows and match context for agent code-reading
+# Native file inspection for agent code-reading
 ix inspect crates/iex-cli/src/main.rs --range 40:80
 ix inspect --expr "lit:SearchConfig" crates --context 2 --json
 
-# Inspect the execution path a predicate compiles to
+# Inspect the execution plan a query compiles to
 ix explain "lit:breach && lit:auth"
 ```
 
-**Binaries (no Rust required):** [github.com/savageops/iEx/releases](https://github.com/savageops/iEx/releases)
+Pre-built binaries for Windows, Linux, and macOS are published on [Releases](https://github.com/savageops/iEx/releases). The Cargo crate is `iex-cli`; the operator-facing binary is `ix` to keep shell usage short and avoid PowerShell's built-in `iex` alias.
 
 ---
 
-## rg-style ingress compatibility
+## Command surface
 
-`ix search`, `ix matches`, `ix inspect`, and `ix explain` are the canonical command surface for the IX engine. The Cargo package remains `iex-cli`; the operator-facing binary is `ix` so shell usage stays short and avoids PowerShell's built-in `iex` alias. For agent-friendly local search, IX also accepts a narrow ripgrep-shaped ingress layer and lowers it into the same native search path.
+iex exposes a deliberately narrow set of commands. Each is an entry point into the same engine; they differ in the output contract, not the matcher.
 
-- `ix PATTERN [PATH]...`
-- `ix -e PATTERN [PATH]...`
-- `ix -F`
-- `ix -i`
-- `ix -j`
-- `ix -n` as a no-op
-- `ix --json`
-- `ix --hidden`
+| Command | Purpose |
+| --- | --- |
+| `ix search` | Full search with hits, stats, and structured output |
+| `ix matches` | Hit records only — same engine, leaner contract |
+| `ix inspect` | Native file windowing and match context for agent code-reading |
+| `ix explain` | Returns the execution plan a query compiles to, before running it |
 
-If a request falls outside that subset, IX returns a guided non-zero error instead of trying to emulate full ripgrep behavior.
+### rg-shaped ingress compatibility
 
----
+For interactive use and operator muscle memory, iex accepts a narrow ripgrep-shaped ingress and lowers it into the canonical search path:
 
-## Developer inspection
+| Flag | Behavior |
+| --- | --- |
+| `ix PATTERN [PATH]...` | Positional pattern, defaults to current directory |
+| `ix -e PATTERN` | Explicit pattern, repeatable |
+| `ix -F` | Fixed-string match |
+| `ix -i` | Case-insensitive |
+| `ix -j` / `--json` | Structured JSON output |
+| `ix -n` | No-op (line numbers always present in structured output) |
+| `ix --hidden` | Include hidden files |
 
-`ix inspect` replaces common shell-specific code-reading fragments with native Rust contracts:
+Anything outside this subset returns a guided non-zero error rather than emulating full ripgrep behavior. The compatibility layer exists to remove ingress friction; iex is not a ripgrep clone.
 
-| Workflow | IX command |
-|---|---|
+### Developer inspection
+
+`ix inspect` replaces fragile shell pipelines (`head | tail | sed`) with native Rust contracts:
+
+| Workflow | Command |
+| --- | --- |
 | First N lines | `ix inspect file --total-count 40` |
 | Skip then take | `ix inspect file --skip 120 --limit 30` |
 | Sed-style print range | `ix inspect file --range 40:80` |
 | Match context | `ix inspect --expr "lit:SearchConfig" crates --context 2` |
-| Structured excerpts | `ix inspect --expr "re:TODO|FIXME" crates --context 1 --json` |
+| Structured excerpts | `ix inspect --expr "re:TODO\|FIXME" crates --context 1 --json` |
 
-Inspection is read-only. Mutation, replacement, and in-place write behavior belong to a future transform command, not to `inspect`.
-
-Detailed schema and ownership notes: [docs/developer-inspection-command-surface.md](docs/developer-inspection-command-surface.md)
+Inspection is read-only; mutation is out of scope. Detailed schema in [`docs/developer-inspection-command-surface.md`](docs/developer-inspection-command-surface.md).
 
 ---
 
 ## Expression language
 
-An explicit predicate syntax with native boolean composition. The expression plan is compiled once at parse time and does not change during execution. Use `ix explain` to inspect the machine a pattern lowers to before running a search.
+iex uses an explicit predicate syntax with native boolean composition. The plan is compiled once at parse time and is immutable for the duration of execution.
 
 | Predicate | Semantics | Example |
-|---|---|---|
+| --- | --- | --- |
 | `lit:` | Substring containment | `lit:error` |
-| `prefix:` | Line-anchored prefix match | `prefix:WARN` |
-| `suffix:` | Line-anchored suffix match | `suffix:.json` |
-| `re:` | Regex -- lowered to Rust regex text/byte plans plus narrow fast paths | `re:\btimeout\b` |
+| `prefix:` | Line-anchored prefix | `prefix:WARN` |
+| `suffix:` | Line-anchored suffix | `suffix:.json` |
+| `re:` | Rust regex with narrow fast paths | `re:\btimeout\b` |
 
-- `A && B` -- conjunction; all predicates must hold on the same line
-- `A || B` -- disjunction; any predicate holds
-- `re:` follows the current Rust `regex` syntax contract. Look-around and backreferences are not part of the shipped engine surface.
-
----
-
-## Benchmark governance
-
-IX keeps three benchmark surfaces aligned:
-
-- canonical external raw baseline: `npm run bench:report` -> `tools/reports/bench/ripgrep-benchsuite-*.csv`
-- live operator diagnostics: `npm run bench:loop` -> `tools/reports/live-metrics.jsonl`
-- exact binary proof: timestamped `tools/reports/candidate-compare/ix-*.exe` snapshots plus compare artifacts; older `iex-cli-*.exe` snapshots remain immutable historical proof
-
-Current Windows proof snapshot, captured in `tools/reports/candidate-compare/110-ix-current-vs-installed-20260427-233905/summary.json`:
-- current build: `target/release/ix.exe`
-- installed predecessor comparator: `C:\Users\Savage\AppData\Local\Programs\iEx\bin\iex.exe`
-- suite shape: `12/12` wins versus ripgrep and `9/12` wins versus the installed predecessor on the three-sample dashboard suite
-- exact focused recheck: `suite-en-alternates` is green at `0.9679x` versus installed; confirmed predecessor-loss frontier is `suite-linux-no-literal` at `1.0974x` and `suite-linux-word` at `1.0286x`
-- active cost center: Linux scan lanes, `144,017,913` dominant targeted bytes, no dominant shard activation, top tail files in AMD ASIC register headers
-
-Key live fields:
-- `iexMs`, `iexCliMs`, and `iexProcessOverheadMs`
-- `phaseMs`, `slowestFiles`, and `concurrency`
-- `regexDecomposition` for eligible/count/bailout/candidate-line attribution on decomposed regex lanes
-- `competitors.ripgrep` and optional `competitors.iex_previous`
-
-Promotion rule:
-1. snapshot the current canonical or live binary
-2. compare the candidate against that exact snapshot on the exact workload
-3. only then restart the loop on a timestamped immutable snapshot if the suite-level proof is neutral or better
-
-```sh
-npm run bench:report
-npm run bench:loop
-npm run bench:once -- --expression "re:\\w+\\s+Holmes\\s+\\w+" --corpus ".refs/ripgrep/benchsuite/subtitles/en.sample.txt"
+```
+A && B    conjunction — all predicates hold on the same line
+A || B    disjunction — any predicate holds
 ```
 
----
+Regex follows the current Rust `regex` syntax contract. Look-around and backreferences are not part of the shipped engine surface — both classes of feature break the predictability guarantees the planner depends on.
 
-## Target corpus classes
-
-- **Agent retrieval corpora** -- JSONL memory stores, exported session transcripts, tool execution artifacts, multi-run evaluation dumps with heterogeneous record geometry
-- **Observability pipelines** -- structured log streams, distributed traces, event queues, crash captures, and wide operational records with non-uniform line geometry at scale
-- **Forensic and IR workloads** -- incident reconstruction, malware triage, breach attribution, and evidence-heavy search surfaces requiring exact match counts with reproducible results
-- **Post-uniform-tree codebases** -- vendor-saturated monorepos, generated output trees, lockfile-heavy repositories, minified bundle collections, mixed-root searches spanning source and build artifacts
-- **Unstructured accumulations** -- scraped document corpora, archived exports, ML output stores, notebook accumulations with pathological tail-file distributions
+`ix explain` returns the structured plan a query compiles to. This is the primary tool for understanding why a query is fast or slow before issuing it. Plans are stable across runs and machine-readable.
 
 ---
 
 ## Architecture
 
-<details>
-<summary><strong>Execution mode selection</strong></summary>
+The engine is composed of four layers, each with a narrow ownership contract:
 
-IX routes each workload through one of three execution modes based on live corpus telemetry. Mode selection is automatic and requires no configuration.
+1. **Pattern lowering** — HIR analysis classifies the query into the narrowest exact execution machine that preserves Rust regex semantics.
+2. **Concurrency planner** — workload shape, machine profile, and plan readiness determine execution mode and shard geometry before any worker starts.
+3. **Byte-range sharding** — when a single file dominates corpus volume, the file is partitioned into disjoint owned byte ranges with widened read windows for boundary safety.
+4. **Telemetry** — every run exports a structured stats block including thread budget, shard activation, geometry, and slowest-file attribution.
 
-```mermaid
-flowchart TD
-    A[Workload classification] --> B{Vertical dominance?\nSingle file > 80% byte volume}
-    B -->|No| C{Stats-only mode?}
-    C -->|Yes| D[Streaming pipeline\ncrossbeam bounded channel cap 1024\nWalker and scan workers overlap\nEliminates full-materialization staging tax]
-    C -->|No| E[Materialized scan\nDiscover then dedupe roots then parallel scan]
-    B -->|Yes| F[Geometric sharding\nRayon scoped threads\nCo-determined geometry\nPartitioned aggregation]
-    D --> G[Telemetry: max of discovery_ms and scan_ms]
-    E --> G
-    F --> H[Telemetry: max shard_ms plus combine_us\nAmdahl surface directly observable]
-```
+### Byte-range sharding
 
-Streaming pipelines apply backpressure through `crossbeam`'s bounded channel capacity to prevent memory accumulation on wide artifact trees. Discovery and scan overlap in wall-clock time in streaming mode, eliminating the full path-list materialization tax before scanning begins. Both modes export a `stats.concurrency` block: resolved thread counts, shard activation state, range geometry, and chunk sizing.
+File-level parallelism is structurally insufficient when a single file holds the majority of corpus bytes. A 3 GB file with 31 sibling files in a 32-thread machine has 31 idle threads while one thread scans the giant file serially. This is the dominant tail-cost surface in observability dumps, JSONL memory stores, kernel source trees, and any corpus where one artifact is materially larger than the rest.
 
-</details>
-
-<details>
-<summary><strong>Concurrency planner</strong></summary>
-
-The planner ingests the parsed `ExpressionPlan`, corpus shape signals, and machine profile from `std::thread::available_parallelism()`, then emits an `ExecutionBudget` governing thread allocation, execution mode, and shard geometry for the full run. No worker starts before those decisions are committed.
-
-```mermaid
-flowchart TB
-  subgraph Inputs["Inputs"]
-    I1["ExpressionPlan (parsed)"]
-    I2["Roots + flags\nhidden · follow · stats-only · max-hits"]
-    I3["Machine profile\navailable_parallelism · memory · OS"]
-  end
-  subgraph Shape["Workload Shape Classification"]
-    S1["Discovery shape\nsingle file · wide tree · mixed roots"]
-    S2["Corpus shape\nfile_count · size percentiles · tail dominance"]
-    S3["Plan shape\nshard-safe fast-count · hit materialization"]
-  end
-  subgraph Planner["ConcurrencyPlanner"]
-    P1["Resolve execution mode\nstreaming vs materialized"]
-    P2["Resolve thread budgets\nouter workers · inner shard threads"]
-    P3["Resolve shard geometry\nchunk_bytes · range_count · overlap window"]
-    P4["Emit ExecutionBudget and telemetry contract"]
-  end
-  subgraph Exec["Execution -- single run-scoped thread pool"]
-    subgraph Discovery["Discovery"]
-      D1["Streaming walker\nignore build_parallel"]
-      D2["Materialized list\ndedupe and prune roots"]
-    end
-    subgraph Scan["Scan and Count"]
-      O1["Outer scan workers\npaths to scan_file"]
-      F1["Fast-count path\nstats-only · shard-safe"]
-      B1["Byte-range sharding\nowned ranges with overlap"]
-      A1["Aggregate and report\ntotal_ms is the promotion metric"]
-    end
-  end
-  subgraph Outputs["Telemetry"]
-    T1["SearchReport.stats\nthreads_chosen · sharding_active\nrange_count · chunk_bytes · tail_files"]
-  end
-  I1 --> Shape
-  I2 --> Shape
-  I3 --> Planner
-  Shape --> Planner
-  Planner --> Exec
-  Planner --> T1
-  Scan --> T1
-```
-
-Thread budget resolution and geometry resolution are co-scoped. The planner does not allocate outer workers and shard workers independently, which prevents nested oversubscription across the single run-scoped pool. Streaming discovery is currently owned by `ignore`; pool unification is a planned promotion.
-
-</details>
-
-<details>
-<summary><strong>Pattern lowering</strong></summary>
-
-Regex planning is a lowering step, not a second engine. `regex-syntax` HIR analysis classifies the narrowest exact machine that preserves the current Rust regex contract. For eligible stats-only byte-mode regexes, the planner can extract a strongest required literal, optionally prove local context such as `word + whitespace + literal + whitespace + word`, then recover line bounds around whole-buffer candidate hits before running full `regex::bytes` confirmation on those lines.
-
-```mermaid
-flowchart TD
-    Q[Query string] --> AST[regex-syntax HIR walk\nrequired literal extraction\nlocal context gating]
-    AST --> C1{Whole-pattern literal?}
-    C1 -->|Yes| P1[PlainLiteral\nmemmem · AVX2 / SSE2 / NEON\n~30 GB/s]
-    C1 -->|No| C2{ASCII case-fold literal?}
-    C2 -->|Yes| P2[AsciiCaseFoldLiteral\nAVX-512 vpternlogd · opmask registers\nbyte OR + compare in 1 cycle\n10+ GB/s · no movemask roundtrip]
-    C2 -->|No| C3{Word-boundary literal?}
-    C3 -->|Yes| P3[WordBoundaryLiteral\nmemchr + byte mask · SSE2/NEON]
-    C3 -->|No| C4{Alternation of short literals?}
-    C4 -->|Yes| P4[LiteralAlternates\nAho-Corasick · Teddy SIMD · packed=true\n2 to 10x over standard AC]
-    C4 -->|No| C5{Decomposition eligible?}
-    C5 -->|Yes| P5[RegexDecomposition stats-only path\nwhole-buffer literal finder\nline-boundary recovery\nfull bytes-regex confirm]
-    C5 -->|No| P6[Generic bytes regex\ncanonical byte-mode line scan fallback]
-```
-
-| Machine | Implementation | Activation |
-|---|---|---|
-| `PlainLiteral` | `memmem` over bytes | whole-pattern literal |
-| `AsciiCaseFoldLiteral` | specialized ASCII case-fold searcher | ASCII literal with `(?i)` semantics |
-| `WordBoundaryLiteral` | `memchr` plus boundary checks | literal-equivalent `\b...\b` |
-| `LiteralAlternates` | `aho-corasick` Teddy backend | short literal alternation families |
-| `FixedWidthBytesRegex` | `regex::bytes` fast-count path | narrow non-ASCII `(?i)` literal-equivalent regexes with stable byte width |
-| `RegexDecomposition` | whole-buffer literal discovery, optional context gate, line-boundary recovery, full `regex::bytes` confirm | stats-only regexes with one strong required literal and no narrower fast path |
-| `Generic bytes regex` | `regex::bytes` on the canonical byte-mode line loop | fallback regex execution |
-
-The `AsciiCaseFoldLiteral` path executes `(byte OR 0x20) == (pattern OR 0x20)` in a single `vpternlogd` instruction cycle. Opmask registers (`k0` through `k7`) produce per-byte results directly, removing the 32-byte to 32-bit `movemask` extraction roundtrip that caps AVX2 case-fold throughput at roughly 1 to 3 GB/s.
-
-The Teddy SIMD backend, ported from Intel Hyperscan, activates via `.packed(Some(true))` on `AhoCorasickBuilder`. For `LiteralAlternates` patterns under 64 short literals it runs 2 to 10x faster than standard automaton traversal.
-
-The decomposition path is intentionally narrower than a generic regex prefilter story. It only activates when the planner can prove one strong required literal, no better fast path already owns the pattern, and candidate-line volume stays below the bailout ceiling.
-
-### Regex decomposition byte sharding
-
-`RegexDecomposition` uses byte sharding as a bounded literal-discovery accelerator, not as arbitrary parallel regex execution. The planner first proves a required literal anchor, then shards only the full-buffer anchor walk. Each shard owns candidate literal starts inside its byte interval and reads a right-extended window so boundary-crossing anchors remain visible without transferring ownership to the neighboring shard. Context gates evaluate against the full haystack, never a truncated shard slice.
-
-After shard-local discovery, IX merges candidate line starts globally with `sort_unstable` plus `dedup`. Full `regex::bytes` confirmation runs once per unique candidate line, preserving serial match-count semantics while avoiding duplicate confirmations when multiple anchors land on one line or a candidate line crosses a shard seam. The current activation gate is intentionally small: stats-only regex decomposition, one outer scan thread, file length at least `64 MiB`, and at most two shard workers.
-
-| Phase | Byte-sharding invariant |
-| --- | --- |
-| Anchor discovery | Parallel `memmem`-style literal traversal over owned byte intervals. |
-| Boundary handling | Right-extended scan windows expose seam-spanning anchors. |
-| Candidate ownership | Candidate starts are credited only to the shard-owned byte range. |
-| Context filtering | Guards read the original full buffer so lookaround context is exact. |
-| Regex confirmation | Unique candidate lines are confirmed once with `regex::bytes`. |
-
-This shifts the hot work from one serial full-buffer anchor pass into owned byte-range passes while keeping regex execution sparse and exact. In the retained `suite-en-surrounding-words` proof, the lane moved from `42.55 ms` on the pre-change snapshot to `27.92 ms` with `39/39` match-count parity. Operators can verify activation through `sharding_enabled`, `max_shard_threads`, `max_shard_ranges`, and the `regexDecomposition` report block.
-
-</details>
-
-<details>
-<summary><strong>Shard geometry</strong></summary>
-
-File-level parallelism is structurally insufficient when a single file dominates corpus byte volume. IX shards inward: the file is partitioned into disjoint owned byte ranges, each processed by a dedicated Rayon worker.
-
-Shard geometry is solved before any worker starts. Thread budget, chunk sizing, and range count are co-determined to keep workers fed without generating scheduler overhead on underfeedable shard counts. The planner enforces a minimum chunk floor by file regime (16 MB for medium-large, 64 MB for dominant giant files) and caps worker count at the number of ranges the file can actually sustain.
-
-```mermaid
-flowchart TD
-    A[File length] --> B{Shard-safe path?\ncount-only + deterministic plan}
-    B -->|No| Z[Non-sharded scan kernel]
-    B -->|Yes| C[Shard budget\nmin of available_parallelism and run budget]
-    C --> D[Geometry floor by file regime\nmedium-large: 16MB · dominant giant: 64MB]
-    D --> E[Max useful ranges\nR = file_len divided by floor]
-    E --> F{Thread budget T > R?}
-    F -->|Yes| G[Cap workers at R\nNo fake parallelism]
-    F -->|No| H[Use T workers]
-    G --> I[Target ranges-per-worker >= 2\nWork-stealer headroom]
-    H --> I
-    I --> J[chunk_bytes = file_len divided by workers\nFinal range count from geometry]
-    J --> K[Build owned ranges 0..file_len]
-    K --> L[Widen read windows by overlap\nBoundary candidate visibility]
-    L --> M[SIMD scan per shard]
-    M --> N{Match start byte in owned range?}
-    N -->|Yes| O[Increment private counter\nCache-line aligned · no atomic contention]
-    N -->|No| P[Discard]
-    O --> Q[Reduce across shards\nExact aggregate total]
-    P --> Q
-```
-
-| Failure Mode | Cause | Resolution |
-|---|---|---|
-| Fake parallelism | Thread count exceeds useful range count; workers starve | Cap `shard_workers = min(T, R)` |
-| Undersized shards | Chunk bytes too small; scheduler overhead exceeds scan throughput | Enforce regime floor: 16 MB (medium), 64 MB (giant) |
-| Work-stealer starvation | `ranges_per_worker < 2`; no steal candidates for Rayon | Target `R / workers >= 2` before finalizing geometry |
+iex partitions the dominant file into disjoint owned byte ranges. Each Rayon worker reads a widened window (its owned range plus a boundary overlap) to ensure boundary-spanning matches remain visible. Each match is credited exclusively to the shard whose owned range contains the match's true start byte.
 
 ```mermaid
 flowchart LR
@@ -346,80 +168,153 @@ flowchart LR
     C2 --> Total
 ```
 
-Workers read widened overlap windows to catch matches spanning range boundaries. Each match is credited exclusively to the shard whose owned range contains the match's true start byte. Per-shard counters are cache-line aligned to prevent false sharing and reduce once at completion.
+Three failure modes are eliminated together by co-resolving thread budget with shard geometry:
 
-Throughput comes from geometry. Exactness comes from ownership.
+- **Fake parallelism.** When thread count exceeds useful range count, workers starve. The planner caps `shard_workers = min(threads, ranges)`.
+- **Undersized shards.** When chunk bytes drop below scheduler overhead, parallelism is a net loss. A regime-based floor enforces minimum chunk size: 16 MB for medium-large files, 64 MB for dominant giant files.
+- **Work-stealer starvation.** When ranges-per-worker drops below 2, Rayon has no steal candidates. Geometry is solved with `R / workers >= 2` before any worker runs.
 
-</details>
+Per-shard counters are cache-line aligned to prevent false sharing and reduce once at completion. The aggregate is exact: throughput comes from geometry, exactness from ownership.
 
-<details>
-<summary><strong>Byte ingress tiers</strong></summary>
+### Concurrency planner
 
-Before the planner activates, ingress commits to the current source-of-truth file loading strategy in `engine.rs`. Tiny files stay inline, small files are fully read into memory, and larger files are memory-mapped. Binary payloads are rejected on a null-byte sniff before the line scanner or fast-count path runs.
+The planner ingests the parsed `ExpressionPlan`, corpus shape signals, and `std::thread::available_parallelism()` to emit an `ExecutionBudget` that governs thread allocation, execution mode, and shard geometry for the run. Outer worker count and inner shard count are co-resolved to prevent nested oversubscription across the single run-scoped pool.
 
 ```mermaid
-flowchart LR
-    A[Open file] --> B{fits in first 16KiB read?}
-    B -->|Yes| C[Inline stack buffer\nscan_loaded_bytes]
-    B -->|No| D{metadata.len <= 256KiB?}
-    D -->|Yes| E[Vec_u8 full read\nscan_loaded_bytes]
-    D -->|No| F[memmap2 mmap\nscan_loaded_bytes]
-    C --> G[Null-byte sniff]
-    E --> G
-    F --> G
-    G -->|Binary| H[Skip file]
-    G -->|Text| I[Planner and scan kernel]
+flowchart TB
+  subgraph Inputs["Inputs"]
+    I1["ExpressionPlan (parsed)"]
+    I2["Roots + flags<br/>hidden · follow · stats-only · max-hits"]
+    I3["Machine profile<br/>available_parallelism · memory · OS"]
+  end
+  subgraph Shape["Workload shape"]
+    S1["Discovery shape<br/>single file · wide tree · mixed roots"]
+    S2["Corpus shape<br/>file count · size percentiles · tail dominance"]
+    S3["Plan shape<br/>shard-safe · fast-count · hit materialization"]
+  end
+  subgraph Planner["Concurrency planner"]
+    P1["Resolve execution mode<br/>streaming vs materialized"]
+    P2["Resolve thread budgets<br/>outer workers · inner shard threads"]
+    P3["Resolve shard geometry<br/>chunk_bytes · range_count · overlap"]
+    P4["Emit ExecutionBudget + telemetry contract"]
+  end
+  Inputs --> Shape
+  Shape --> Planner
+  Planner --> Exec[Single run-scoped thread pool]
+  Planner --> Telem[Structured telemetry export]
 ```
 
+Execution mode is selected from corpus geometry, not configured by the operator:
+
+| Mode | Activation | Telemetry |
+| --- | --- | --- |
+| Streaming pipeline | stats-only on wide trees | `discovery_ms`, `scan_ms`, channel depth |
+| Materialized scan | hit-bearing search on wide trees | `phase_ms`, `slowest_files`, dedupe stats |
+| Geometric sharding | single file dominates corpus volume | `shard_ms`, `combine_us`, `range_count`, `chunk_bytes` |
+
+Streaming pipelines apply backpressure through `crossbeam`'s bounded channel capacity to prevent memory accumulation on wide artifact trees. Discovery and scan overlap in wall-clock time, eliminating the full path-list materialization tax.
+
+### Pattern lowering
+
+Regex planning is a lowering step, not a second engine. `regex-syntax` HIR analysis classifies the narrowest exact machine that preserves the Rust regex contract:
+
+| Machine | Implementation | Activation |
+| --- | --- | --- |
+| `PlainLiteral` | `memmem` over bytes | whole-pattern literal |
+| `AsciiCaseFoldLiteral` | specialized ASCII case-fold searcher | ASCII literal under `(?i)` |
+| `WordBoundaryLiteral` | `memchr` + boundary checks | literal-equivalent `\b...\b` |
+| `LiteralAlternates` | `aho-corasick` Teddy backend | short literal alternation |
+| `FixedWidthBytesRegex` | `regex::bytes` fast-count path | non-ASCII `(?i)` literal-equivalent regex with stable byte width |
+| `RegexDecomposition` | whole-buffer literal discovery, optional context gate, line recovery, full `regex::bytes` confirm | stats-only regex with one strong required literal and no narrower fast path |
+| Generic bytes regex | `regex::bytes` on canonical byte-mode loop | fallback |
+
+The `AsciiCaseFoldLiteral` path executes `(byte | 0x20) == (pattern | 0x20)` in a single `vpternlogd` cycle on AVX-512. Opmask registers (`k0`–`k7`) yield per-byte results directly, eliminating the AVX2 `movemask` extraction roundtrip that caps standard case-fold throughput at 1–3 GB/s.
+
+The Teddy SIMD backend (ported from Intel Hyperscan) activates via `.packed(Some(true))` on `AhoCorasickBuilder`. For `LiteralAlternates` patterns under 64 short literals it runs 2–10× faster than standard automaton traversal.
+
+`RegexDecomposition` is intentionally narrow: it activates only when the planner can prove one strong required literal, no better fast path already owns the pattern, and candidate-line volume stays below the bailout ceiling. This is not a generic regex prefilter story.
+
+### Byte ingress tiers
+
+Before the planner activates, ingress commits to a file loading strategy. The thresholds are constants in `engine.rs`, not aspirational tiers:
+
 | Tier | Bound | Strategy | Rationale |
-|---|---|---|---|
-| Tiny | `< 16 KiB` | stack buffer inline read | avoid heap allocation for very small files |
-| Small | `<= 256 KiB` | `Vec<u8>` full read | cheap full-file ownership for small payloads |
-| Large | `> 256 KiB` | `memmap2` mapping | hand the scan kernel a byte slice without copying the whole file |
+| --- | --- | --- | --- |
+| Tiny | < 16 KiB | inline stack buffer | avoid heap allocation for very small files |
+| Small | ≤ 256 KiB | `Vec<u8>` full read | cheap full-file ownership |
+| Large | > 256 KiB | `memmap2` mapping | hand the scan kernel a slice without copying |
 
-These thresholds are current code constants, not aspirational tiers: `TINY_FILE_INLINE_LIMIT = 16 * 1024` and `SMALL_FILE_INLINE_LIMIT = 256 * 1024`.
-
-</details>
-
-<details>
-<summary><strong>Build profiles</strong></summary>
-
-The repo currently defines one explicit performance-focused profile in `Cargo.toml`:
-
-| Profile | Setting | Effect |
-|---|---|---|
-| `release-lto` | `lto = "fat"` | whole-program optimization across crate boundaries |
-| `release-lto` | `codegen-units = 1` | larger inlining surface and slower build, faster proof binary |
-
-Benchmark proof should always record the exact binary path it used instead of assuming a profile name or mutable `target/release/ix.exe` state.
-During the command rename, `target/release/ix.exe` is the primary benchmark binary while `target/release/iex-cli.exe` remains available as a compatibility build artifact.
-
-</details>
+Binary payloads are rejected on a null-byte sniff before the line scanner runs.
 
 ---
 
-## Install
+## Benchmark contract
 
-**Binaries:** [github.com/savageops/iEx/releases](https://github.com/savageops/iEx/releases)
+iex maintains three benchmark surfaces. None is optional.
 
-| Platform | Binary |
-|---|---|
-| Windows | `ix.exe` |
-| Linux / macOS | `ix` |
+```
+canonical external baseline   →  npm run bench:report   →  CSV in tools/reports/bench/
+live operator diagnostics     →  npm run bench:loop     →  JSONL in tools/reports/live-metrics/
+exact binary proof            →  immutable snapshots in tools/reports/candidate-compare/
+```
 
-**From source:**
+**Promotion rule.** A new build does not replace its predecessor unless:
+
+1. The current canonical or live binary is snapshotted to a timestamped path.
+2. The candidate is compared against that exact snapshot on the exact workload.
+3. Suite-level proof is neutral or better — never regressive.
+
+Only then does the loop restart on the new immutable snapshot. The rule applies to every engine change, including changes that pass unit tests, including changes that improve a single motivating lane. A motivating lane win that introduces a guard regression elsewhere is not a promotion.
+
+### Current proof — Windows
+
+Captured in `tools/reports/candidate-compare/110-ix-current-vs-installed-20260427-233905/summary.json`:
+
+| Metric | Result |
+| --- | --- |
+| Current build | `target/release/ix.exe` |
+| Predecessor comparator | `C:\Users\Savage\AppData\Local\Programs\iEx\bin\iex.exe` |
+| **Versus ripgrep** | **12/12 wins** on the three-sample dashboard suite |
+| Versus installed predecessor | 9/12 wins |
+| Focused recheck | `suite-en-alternates` green at 0.9679× versus installed |
+| Confirmed loss frontier | `suite-linux-no-literal` (1.0974×), `suite-linux-word` (1.0286×) |
+| Active cost center | Linux scan lanes, 144 MB dominant targeted bytes |
+
+### Live telemetry fields
+
+Every benchmark run exports:
+
+- `iexMs`, `iexCliMs`, `iexProcessOverheadMs` — engine, CLI, and process-overhead timing
+- `phaseMs`, `slowestFiles`, `concurrency` — phase breakdown and execution metadata
+- `regexDecomposition` — eligible / count / bailout / candidate-line attribution for decomposed regex lanes
+- `competitors.ripgrep`, optional `competitors.iex_previous` — head-to-head measurement against the predecessor
 
 ```sh
-cargo build --release -p iex-cli
-# target/release/ix
+npm run bench:report
+npm run bench:loop
+npm run bench:once -- --expression "re:\\w+\\s+Holmes\\s+\\w+" --corpus ".refs/ripgrep/benchsuite/subtitles/en.sample.txt"
 ```
+
+---
+
+## Target workloads
+
+iex is designed for corpora where conventional engines hit a structural ceiling:
+
+- **Local agent retrieval** — JSONL memory stores, exported session transcripts, tool execution artifacts, multi-run evaluation dumps
+- **Observability and traces** — structured logs, distributed traces, event queues, crash captures
+- **Forensic and incident response** — exact match counts with reproducible results across evidence-heavy corpora
+- **Post-uniform-tree codebases** — vendor-saturated monorepos, generated trees, lockfile-heavy repositories, mixed source-and-build roots
+- **Unstructured accumulations** — scraped corpora, archived exports, ML output stores, notebook dumps with pathological tail-file distributions
+
+The common thread is a tail-dominant byte distribution — the workload class where byte-range sharding is the difference between a usable matcher and a single-threaded one.
 
 ---
 
 ## Repository
 
 | Path | Concern |
-|---|---|
+| --- | --- |
 | `crates/iex-core` | Planner, scan kernel, shard geometry, telemetry |
 | `crates/iex-cli` | CLI surface (`search`, `matches`, `inspect`, `explain`) |
 | `crates/iex-bench` | Benchmark instrumentation |
@@ -428,13 +323,13 @@ cargo build --release -p iex-cli
 | `tools/reports/` | Benchmark outputs and differentials |
 | `dashboard/` | Live benchmark loop |
 | `.refs/` | Pinned competitor and corpus reference clones |
-| `.docs/iex-v2-crown-jewel.md` | IX architecture decisions and benchmark doctrine |
+| `.docs/iex-v2-crown-jewel.md` | Architecture decisions and benchmark doctrine |
 
 **Read next:**
-- `crates/iex-core/src/engine.rs` -- scan engine, concurrency planner, shard geometry
-- `crates/iex-core/src/expr.rs` -- expression lowering, fast-path machine classification
-- `.docs/iex-v2-crown-jewel.md` -- benchmark doctrine and promotion criteria
-- `.docs/project-distill-2026-04-22.md` -- current cold-start architecture and proof state
+- `crates/iex-core/src/engine.rs` — scan engine, concurrency planner, shard geometry
+- `crates/iex-core/src/expr.rs` — expression lowering, fast-path machine classification
+- `.docs/iex-v2-crown-jewel.md` — benchmark doctrine and promotion criteria
+- `.docs/project-distill-2026-04-27.md` — current cold-start architecture and proof state
 
 ---
 
